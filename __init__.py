@@ -32,11 +32,17 @@ from app import settings, tools
 from app import plugins as _plugins
 from app.database import audit_log
 from . import emberplus_glow as glow
+from . import profile as _profile
 
 log = logging.getLogger(__name__)
 
 # Acteur virtuel attribué dans l'audit pour toute modification venant d'Ember+.
 EMBER_ACTOR = "Service Ember+"
+
+# Racine FIXE du « moule IPG » (mode canonique, monté par slot). Valeur haute et stable,
+# distincte des racines par-plugin (1..k) : garantit un chemin VSM stable quels que soient
+# les plugins activés. Structure sous cette racine : [IPG, slot, voie, bloc, param].
+IPG_ROOT_ID = 1000
 
 NOTIFY_DEBOUNCE_S = 1.0        # max 1 broadcast / seconde
 TREE_TTL_S = 5.0               # ré-agrégation de l'arbre au plus toutes les 5 s
@@ -87,6 +93,14 @@ def _ember_types():
     """Types des outils activés déclarant `ember: true`, triés (index racine stable)."""
     out = [m.get("type") for m in _plugins.all()
            if m.get("ember") and not _plugins.is_disabled(m.get("type"))]
+    return sorted(t for t in out if t)
+
+def _bindings_types():
+    """Types déclarant `ember_bindings: true` (mode « moule IPG ») : seuls ceux-là sont
+    interrogés sur GET ember/bindings — évite un aller-retour 404 (potentiellement lent) vers
+    les contributeurs qui n'implémentent que ember/tree (switch_ports…)."""
+    out = [m.get("type") for m in _plugins.all()
+           if m.get("ember_bindings") and not _plugins.is_disabled(m.get("type"))]
     return sorted(t for t in out if t)
 
 def _walk_node(parent_path, node, elements, path_map, matrix_map, type_):
@@ -148,10 +162,92 @@ def _matrix_body(mpath, m):
     """Réponse à GetDirectory(matrice) : la QualifiedMatrix COMPLÈTE (axes + connexions)."""
     return glow.build_collection([], extra=[_encode_matrix(mpath, m, with_axes=True)])
 
+def _ensure_node(elements, seen, path, label):
+    """Émet un nœud (path, label) une seule fois (les nœuds intermédiaires slot/voie/bloc
+    sont partagés par plusieurs paramètres)."""
+    key = tuple(path)
+    if key in seen:
+        return
+    seen.add(key)
+    elements.append((list(path), "node", str(label), ""))
+
+def _append_canonical(elements, path_map, contributors):
+    """Voie CANONIQUE (« moule IPG ») : agrège les `ember/bindings` de tous les outils,
+    bucketise par slot logique, et monte l'arbre sous la racine IPG avec la numérotation
+    FIGÉE du profil → arbre identique quel que soit le device backing un slot.
+
+    Contrat plugin (GET ember/bindings) :
+        { "devices": [ { "slot": int, "label"?: str,
+                         "bindings": [ { "key": "<bloc>.<param>", "lane"?: int,
+                                         "value": <v>, "ref": <opaque> }, ... ] } ] }
+    Un outil qui n'implémente pas la route (status != 200) est simplement ignoré."""
+    prof = _profile.get_profile()
+    index = _profile.build_index(prof)
+
+    # slot -> { "label": str|None, "bindings": [ (type_, binding), ... ] }
+    slots = {}
+    for type_ in _bindings_types():
+        status, data = tools.call(type_, "ember/bindings", "GET", actor=EMBER_ACTOR,
+                                  timeout=TREE_CALL_TIMEOUT_S)
+        if status != 200 or not isinstance(data, dict):
+            continue
+        for dev in data.get("devices") or []:
+            slot = dev.get("slot")
+            if slot is None:
+                continue
+            entry = slots.setdefault(int(slot), {"label": None, "bindings": []})
+            if dev.get("label") and not entry["label"]:
+                entry["label"] = str(dev["label"])
+            for b in dev.get("bindings") or []:
+                entry["bindings"].append((type_, b))
+    if not slots:
+        return
+
+    seen = set()
+    _ensure_node(elements, seen, [IPG_ROOT_ID], prof.get("label") or "IPG")
+    for slot in sorted(slots):
+        entry = slots[slot]
+        _ensure_node(elements, seen, [IPG_ROOT_ID, slot],
+                     entry["label"] or ("Slot %d" % slot))
+        for type_, b in entry["bindings"]:
+            res = index.get(b.get("key"))
+            if not res:
+                log.info("emberplus: binding %r inconnu au profil (ignoré)", b.get("key"))
+                continue
+            lane = int(b.get("lane") or 1)
+            _ensure_node(elements, seen, [IPG_ROOT_ID, slot, lane], "Voie %d" % lane)
+            _ensure_node(elements, seen, [IPG_ROOT_ID, slot, lane, res["block_id"]],
+                         res["block_label"])
+            ppath = [IPG_ROOT_ID, slot, lane, res["block_id"], res["param_id"]]
+            if tuple(ppath) in seen:            # collision (2 devices sur un même slot) → 1er gagne
+                log.warning("emberplus: chemin canonique %s en double (binding %r ignoré)",
+                            ppath, b.get("key"))
+                continue
+            seen.add(tuple(ppath))
+            ptype = _TYPE_MAP.get(res["type"], glow.PT_STRING)
+            value = b.get("value")
+            if res["type"] == "enum":
+                try:
+                    value = int(value or 0)
+                except (TypeError, ValueError):
+                    value = 0
+                el = (ppath, "param", res["param_label"], "", value, ptype, True)
+                if res["enum"]:                 # n'émet une énumération que si des libellés existent
+                    el = el + (res["enum"],)
+            else:
+                el = (ppath, "param", res["param_label"], "", value, ptype, True)
+            elements.append(el)
+            if b.get("ref") is not None:
+                path_map[tuple(ppath)] = (type_, b.get("ref"))
+    contributors.append({"type": "ipg", "label": "%s (%d slot%s)" % (
+        prof.get("label") or "IPG", len(slots), "s" if len(slots) > 1 else "")})
+
 def _build_tree():
     """Agrège les sous-arbres : (body racine, path_map, matrix_map, contributors).
-    Le body racine contient nœuds/params + matrices en CONTENTS-SEULS (annonce sans le
-    payload, pour éviter la déconnexion VSM ; les axes/connexions viennent au GetDirectory)."""
+    Deux voies coexistent : mode LIBRE (ember/tree, monté par plugin) + mode CANONIQUE
+    (ember/bindings, monté par slot sous la racine IPG). Le body racine contient
+    nœuds/params + matrices en CONTENTS-SEULS (annonce sans le payload, pour éviter la
+    déconnexion VSM ; les axes/connexions viennent au GetDirectory)."""
     elements = []
     path_map = {}
     matrix_map = {}
@@ -173,6 +269,10 @@ def _build_tree():
             continue
         elements += sub
         contributors.append({"type": type_, "label": label})
+    try:
+        _append_canonical(elements, path_map, contributors)
+    except Exception as e:
+        log.warning("emberplus: agrégation canonique (IPG) échouée : %s", e)
     extras = [_encode_matrix(p, m, with_axes=False) for p, m in matrix_map.items()]
     body = glow.build_collection(elements, extra=extras)
     return body, path_map, matrix_map, contributors
@@ -534,3 +634,27 @@ def register_routes(bp):
         _audit_log("emberplus", "apply", f"enabled={enabled} port={port}",
                    user_id=None, username="système")
         return jsonify(status_dict())
+
+    @bp.route("/api/emberplus/profile", methods=["GET"])
+    @require_login
+    def emberplus_profile_get():
+        """Profil canonique courant + liste des clés (consommé par l'UI d'exposition
+        des plugins pour peupler le menu déroulant du « moule IPG »)."""
+        prof = _profile.get_profile()
+        return jsonify({"profile": prof, "keys": _profile.keys(prof)})
+
+    @bp.route("/api/emberplus/profile", methods=["POST"])
+    @require_perm("settings.edit")
+    def emberplus_profile_set():
+        """Enregistre un profil canonique édité (« liste exposée »)."""
+        data = request.json or {}
+        if not isinstance(data, dict) or not isinstance(data.get("blocks"), list) \
+                or not data["blocks"]:
+            return jsonify({"error": "profil invalide (blocks requis)"}), 400
+        settings.set("emberplus_profile", json.dumps(data, ensure_ascii=False))
+        refresh()
+        _audit_log("emberplus", "profile",
+                   f"maj profil ({len(data['blocks'])} blocs)",
+                   user_id=None, username="système")
+        return jsonify({"profile": _profile.get_profile(),
+                        "keys": _profile.keys()})

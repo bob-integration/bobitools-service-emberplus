@@ -6,6 +6,7 @@
   "description": "Provider Ember+ générique — agrège les contributions des outils déclarant `ember: true` et les expose en Ember+ S101 (TCP). Compatible VSM et autres contrôleurs broadcast. Sans authentification → à filtrer au niveau réseau.",
   "settings_keys": {
     "emberplus_enabled": { "type": "bool", "default": false },
-    "emberplus_port":    { "type": "int",  "default": 9000 }
+    "emberplus_port":    { "type": "int",  "default": 9000 },
+    "emberplus_profile": { "type": "text", "default": "" }
   }
 }
