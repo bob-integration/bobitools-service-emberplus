@@ -570,11 +570,12 @@ def build_collection(elements, extra=None):
     chaque élément est un QualifiedNode/QualifiedParameter (chemin absolu RELATIVE-OID),
     structure « plate » que les consumers (VSM, tinyEmber+…) reconstruisent en arbre.
     `extra` : éléments DÉJÀ encodés (bytes) à ajouter (ex. QualifiedMatrix)."""
-    wrapped = b""
+    chunks = []
     for path, kind, *args in elements:
-        wrapped += _ctx_explicit(0, _encode_element(path, kind, *args))
+        chunks.append(_ctx_explicit(0, _encode_element(path, kind, *args)))
     for el in (extra or []):
-        wrapped += _ctx_explicit(0, el)
+        chunks.append(_ctx_explicit(0, el))
+    wrapped = b"".join(chunks)
     rec = _app_constructed(G_ROOT_ELEMENT_COLLECTION, wrapped)
     return _app_constructed(0, rec)  # [App 0] Root wrapper
 

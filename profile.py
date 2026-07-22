@@ -16,7 +16,11 @@ Structure d'un profil :
       "blocks": [ { "key": str, "label": str, "id": int,
                     "params": [ { "key": str, "label": str, "id": int,
                                   "type": "string|int|real|bool|enum",
-                                  "unit"?: str, "enum"?: [str] } ] } ] }
+                                  "unit"?: str, "enum"?: [str],
+                                  "writable"?: bool } ] } ] }
+Le drapeau optionnel "writable" (défaut True si absent) déclare si le paramètre est
+inscriptible côté VSM (SetValue autorisé) ; à False pour un statut en lecture seule
+(verrouillage, présence de signal, PTP, voie affectée…).
 
 Le contenu par défaut ci-dessous est PROVISOIRE (« NAP vidéo » minimal) : il valide
 le mécanisme. Le catalogue définitif viendra de l'analyse croisée SNP/Neuron, et sera
@@ -100,7 +104,7 @@ def get_profile():
 
 def build_index(prof=None):
     """Indexe le profil : { "<bloc>.<param>" : {block_id, block_label, param_id,
-    param_label, type, enum} }. Utilisé pour résoudre une clé canonique en `id`."""
+    param_label, type, enum, writable} }. Utilisé pour résoudre une clé canonique en `id`."""
     prof = prof or get_profile()
     idx = {}
     for block in prof.get("blocks") or []:
@@ -117,6 +121,7 @@ def build_index(prof=None):
                 "param_id": int(pid), "param_label": str(p.get("label") or pkey),
                 "type": str(p.get("type") or "string").lower(),
                 "enum": [str(x) for x in (p.get("enum") or [])],
+                "writable": bool(p.get("writable", True)),
             }
     return idx
 

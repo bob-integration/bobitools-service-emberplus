@@ -228,19 +228,20 @@ def _append_canonical(elements, path_map, contributors):
                 continue
             seen.add(tuple(ppath))
             ptype = _TYPE_MAP.get(res["type"], glow.PT_STRING)
+            writable = bool(res.get("writable", True))
             value = b.get("value")
             if res["type"] == "enum":
                 try:
                     value = int(value or 0)
                 except (TypeError, ValueError):
                     value = 0
-                el = (ppath, "param", res["param_label"], "", value, ptype, True)
+                el = (ppath, "param", res["param_label"], "", value, ptype, writable)
                 if res["enum"]:                 # n'émet une énumération que si des libellés existent
                     el = el + (res["enum"],)
             else:
-                el = (ppath, "param", res["param_label"], "", value, ptype, True)
+                el = (ppath, "param", res["param_label"], "", value, ptype, writable)
             elements.append(el)
-            if b.get("ref") is not None:
+            if writable and b.get("ref") is not None:
                 path_map[tuple(ppath)] = (type_, b.get("ref"))
     contributors.append({"type": "ipg", "label": "%s (%d slot%s)" % (
         prof.get("label") or "IPG", len(slots), "s" if len(slots) > 1 else "")})
