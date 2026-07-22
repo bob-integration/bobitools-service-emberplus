@@ -201,8 +201,12 @@ def _append_canonical(elements, path_map, contributors):
     Contrat plugin (GET ember/bindings) :
         { "devices": [ { "slot": int, "label"?: str,
                          "bindings": [ { "key": "<bloc>.<param>", "lane"?: int,
-                                         "value": <v>, "ref": <opaque> }, ... ] } ] }
-    Un outil qui n'implémente pas la route (status != 200) est simplement ignoré."""
+                                         "value": <v>, "ref": <opaque>,
+                                         "min"?: number, "max"?: number }, ... ] } ] }
+    Un outil qui n'implémente pas la route (status != 200) est simplement ignoré.
+    `min`/`max` sont OPTIONNELLES et prioritaires sur celles du profil : une borne décrit le
+    matériel, pas le catalogue canonique — deux familles montées sur le même slot n'ont pas
+    les mêmes limites."""
     prof = _profile.get_profile()
     index = _profile.build_index(prof)
 
@@ -249,7 +253,12 @@ def _append_canonical(elements, path_map, contributors):
             ptype = _TYPE_MAP.get(res["type"], glow.PT_STRING)
             writable = bool(res.get("writable", True))
             value = b.get("value")
-            minimum, maximum = res.get("min"), res.get("max")
+            # Bornes : celles du BINDING l'emportent. Une borne est une caractéristique du
+            # matériel (0..226 trames pour ce SNP), pas du catalogue canonique, qui est commun
+            # à toutes les familles ; le profil ne sert donc que de repli, pour une limite
+            # réellement universelle.
+            minimum = b.get("min") if b.get("min") is not None else res.get("min")
+            maximum = b.get("max") if b.get("max") is not None else res.get("max")
             if res["type"] == "enum":
                 try:
                     value = int(value or 0)
