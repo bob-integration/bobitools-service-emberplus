@@ -46,6 +46,7 @@ IPG_ROOT_ID = 1000
 # Racine du nœud de service (le provider s'expose lui-même). Distincte des racines
 # par-plugin (1..k) et de la racine IPG : aucun risque de collision.
 SERVICE_ROOT_ID = 1001
+_VERSION_CACHE = None          # version lue une fois dans le manifeste (cf. _service_version)
 
 NOTIFY_DEBOUNCE_S = 1.0        # max 1 broadcast / seconde
 TREE_TTL_S = 5.0               # ré-agrégation de l'arbre au plus toutes les 5 s
@@ -329,6 +330,39 @@ def refresh():
 # Nœud « Service Ember+ » : le provider s'expose lui-même
 # ═════════════════════════════════════════════════════════════════════
 
+def _service_version():
+    """Version du service, lue dans son propre manifeste. Lecture directe du fichier voisin
+    plutôt que via `core_plugins` : ce module est chargé PAR le registre, s'y adresser
+    créerait une dépendance circulaire à l'import."""
+    global _VERSION_CACHE
+    if _VERSION_CACHE is None:
+        try:
+            import os
+            with open(os.path.join(os.path.dirname(__file__), "manifest.json"),
+                      encoding="utf-8") as f:
+                _VERSION_CACHE = str(json.load(f).get("version") or "?")
+        except Exception:
+            _VERSION_CACHE = "?"
+    return _VERSION_CACHE
+
+
+def _uptime_str(started_at):
+    """Durée depuis le démarrage, en texte court et lisible au pupitre."""
+    if not started_at:
+        return "—"
+    s = int(max(0, time.time() - started_at))
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if d:
+        return "%d j %d h" % (d, h)
+    if h:
+        return "%d h %02d min" % (h, m)
+    if m:
+        return "%d min %02d s" % (m, s)
+    return "%d s" % s
+
+
 def _append_service_node(elements, path_map):
     """Monte le nœud de service : cadence de poussée (réglable DEPUIS le pupitre) et
     quelques compteurs de diagnostic en lecture seule.
@@ -341,9 +375,17 @@ def _append_service_node(elements, path_map):
     with _lock:
         nsub, ncli = len(_subscribed), len(_clients)
         contribs = ", ".join(c.get("type", "") for c in _status.get("contributors") or [])
+        port = int(_status.get("port") or 0)
+        started = _status.get("started_at")
+        err = _status.get("last_error")
+    # Slots du moule montés : compté sur ce qui vient d'être agrégé — `_append_canonical`
+    # s'exécute AVANT nous, donc le chiffre est exact et non décalé d'un cycle.
+    slots = len({tuple(el[0])[1] for el in elements
+                 if len(el[0]) >= 2 and el[0][0] == IPG_ROOT_ID})
     _ensure_node(elements, set(), [SERVICE_ROOT_ID], "Service Ember+")
     # Identifiant seul, description vide — comme tous les autres paramètres de l'arbre :
     # VÉRIFIÉ, VSM recopie l'identifiant faute de description, donc un champ suffit.
+    # Les `id` ci-dessous sont des CHEMINS VSM : on n'ajoute qu'EN FIN, jamais au milieu.
     elements.append(([SERVICE_ROOT_ID, 1], "param", "update interval (s)", "",
                      _push_interval(), glow.PT_INTEGER, True, None,
                      PUSH_INTERVAL_MIN_S, PUSH_INTERVAL_MAX_S))
@@ -351,6 +393,15 @@ def _append_service_node(elements, path_map):
     elements.append(([SERVICE_ROOT_ID, 3], "param", "Clients", "", ncli, glow.PT_INTEGER, False))
     elements.append(([SERVICE_ROOT_ID, 4], "param", "Contributeurs", "", contribs,
                      glow.PT_STRING, False))
+    elements.append(([SERVICE_ROOT_ID, 5], "param", "Version", "",
+                     _service_version(), glow.PT_STRING, False))
+    elements.append(([SERVICE_ROOT_ID, 6], "param", "Uptime", "",
+                     _uptime_str(started), glow.PT_STRING, False))
+    elements.append(([SERVICE_ROOT_ID, 7], "param", "Port", "", port, glow.PT_INTEGER, False))
+    elements.append(([SERVICE_ROOT_ID, 8], "param", "Slots IPG", "", slots,
+                     glow.PT_INTEGER, False))
+    elements.append(([SERVICE_ROOT_ID, 9], "param", "Dernière erreur", "",
+                     str(err) if err else "—", glow.PT_STRING, False))
 
 
 def _apply_service_setvalue(path, value):
