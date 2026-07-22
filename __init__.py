@@ -55,7 +55,9 @@ _last_push_ts = None           # horodatage de la dernière trame réellement é
 # poussée », qui s'AUTO-ENTRETIENT : pousser met à jour l'horodatage, donc le tick suivant voit
 # une différence, donc pousse à nouveau, indéfiniment. Ces valeurs restent émises dès qu'un
 # changement RÉEL survient, et sont fraîches à chaque GetDirectory.
-VOLATILE_SERVICE_PATHS = {(SERVICE_ROOT_ID, 6), (SERVICE_ROOT_ID, 10)}
+# L'uptime n'y figure PAS : à la minute près il ne bavarde plus, et c'est justement lui qui
+# doit vivre à l'écran. Seule reste la « dernière poussée », intrinsèquement auto-entretenue.
+VOLATILE_SERVICE_PATHS = {(SERVICE_ROOT_ID, 10)}
 
 NOTIFY_DEBOUNCE_S = 1.0        # max 1 broadcast / seconde
 TREE_TTL_S = 5.0               # ré-agrégation de l'arbre au plus toutes les 5 s
@@ -356,20 +358,26 @@ def _service_version():
 
 
 def _uptime_str(started_at):
-    """Durée depuis le démarrage, en texte court et lisible au pupitre."""
+    """Durée depuis le démarrage, en texte court et lisible au pupitre.
+
+    Granularité VOLONTAIREMENT à la minute : ce texte est comparé à chaque cycle pour décider
+    d'une poussée. Avec des secondes il changeait à chaque tick, donc émettait un delta en
+    permanence ; à la minute, il n'en produit qu'un par minute — assez pour que le compteur
+    vive à l'écran, assez peu pour que la veille reste silencieuse. Ce delta fait aussi
+    battement de cœur : le consumer voit que le provider est vivant."""
     if not started_at:
         return "—"
     s = int(max(0, time.time() - started_at))
-    d, s = divmod(s, 86400)
-    h, s = divmod(s, 3600)
-    m, s = divmod(s, 60)
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
     if d:
         return "%d j %d h" % (d, h)
     if h:
         return "%d h %02d min" % (h, m)
     if m:
-        return "%d min %02d s" % (m, s)
-    return "%d s" % s
+        return "%d min" % m
+    return "< 1 min"
 
 
 def _append_service_node(elements, path_map):
