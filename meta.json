@@ -1,8 +1,9 @@
 {
-  "version": "0.1.0",
-  "published_at": "2026-06-26",
+  "version": "0.2.0",
+  "published_at": "2026-07-22",
   "changes": {
     "Nouveautés": [
+      "Diffusion INCRÉMENTALE : le provider ne rediffuse plus l'arbre entier à chaque rafraîchissement. Un index {chemin: élément} de la dernière agrégation sert de point de comparaison (`_diff_elements`) ; l'arbre complet n'est réémis que si la STRUCTURE change (chemin ajouté/retiré : arrivée/départ d'un device, ré-affectation, édition du profil), sinon seuls les éléments dont la valeur ou le libellé a bougé sont poussés — la collection Ember+ étant plate et à chemins absolus, un sous-ensemble est une trame de mise à jour valide. Et à état inchangé, plus rien n'est envoyé du tout (l'ancien code rediffusait tout, même à valeurs identiques). Mesuré sur un arbre de 500 voies : 77 octets pour un paramètre modifié contre ~727 ko pour l'arbre complet, soit un facteur ~9400. Prérequis au passage à un vivier de voies large. `_build_tree` renvoie désormais 5 valeurs (index d'éléments en plus) ; `_broadcast_full_tree` devient `_broadcast_update` ; envoi aux abonnés factorisé dans `_send_frames`.",
       "Service Ember+ extrait du cœur : devient une unité versionnée à part entière (services/emberplus/).",
       "Provider générique : agrège les sous-arbres `ember/tree` des outils, encode Glow, route SetValue/Connect via un `ref` opaque.",
       "Matrice VLAN (switch_ports) validée sur Lawo VSM ; tally crosspoint immédiat sans reconstruction complète de l'arbre."

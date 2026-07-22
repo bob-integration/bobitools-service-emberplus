@@ -81,8 +81,11 @@ _status = {
 # Cache de l'arbre agrégé : body (racine, nœuds/params + matrices en contents-seuls),
 # path_map {tuple(path): (type, ref)} pour SetValue, matrix_map {tuple(path): {...}} pour
 # le routage des crosspoints, contributors.
+# `elements` {tuple(path): élément} est l'index de la DERNIÈRE agrégation : il sert de point
+# de comparaison pour n'émettre que ce qui a bougé (cf. _broadcast_update).
 _tree_lock = threading.Lock()
-_tree_cache = {"ts": 0.0, "body": None, "path_map": {}, "matrix_map": {}, "contributors": []}
+_tree_cache = {"ts": 0.0, "body": None, "path_map": {}, "matrix_map": {}, "contributors": [],
+               "elements": {}}
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -275,7 +278,10 @@ def _build_tree():
         log.warning("emberplus: agrégation canonique (IPG) échouée : %s", e)
     extras = [_encode_matrix(p, m, with_axes=False) for p, m in matrix_map.items()]
     body = glow.build_collection(elements, extra=extras)
-    return body, path_map, matrix_map, contributors
+    # Index par chemin : base de la comparaison incrémentale. Un élément porte à la fois sa
+    # valeur et son libellé, donc comparer les tuples suffit à détecter tout ce qui bouge.
+    el_index = {tuple(el[0]): el for el in elements}
+    return body, path_map, matrix_map, contributors, el_index
 
 def _current_tree(force=False):
     """Renvoie (body, path_map, matrix_map), ré-agrégeant si cache expiré ou forcé."""
@@ -283,10 +289,11 @@ def _current_tree(force=False):
         fresh = (time.monotonic() - _tree_cache["ts"]) < TREE_TTL_S
         if not force and fresh and _tree_cache["body"] is not None:
             return _tree_cache["body"], _tree_cache["path_map"], _tree_cache["matrix_map"]
-    body, path_map, matrix_map, contributors = _build_tree()
+    body, path_map, matrix_map, contributors, el_index = _build_tree()
     with _tree_lock:
         _tree_cache.update({"ts": time.monotonic(), "body": body, "path_map": path_map,
-                            "matrix_map": matrix_map, "contributors": contributors})
+                            "matrix_map": matrix_map, "contributors": contributors,
+                            "elements": el_index})
     with _lock:
         _status["contributors"] = contributors
     return body, path_map, matrix_map
@@ -402,15 +409,8 @@ def _send_frame(sock, body):
         log.debug("emberplus: send échoué : %s", e)
         return False
 
-def _broadcast_full_tree():
-    try:
-        body, _, matrix_map = _current_tree(force=True)
-    except Exception as e:
-        log.error("emberplus: build arbre échoué : %s", e)
-        return
-    # Racine (nœuds/params + matrices contents-seuls) PUIS chaque matrice complète, pour
-    # que les tallies de connexions remontent aux abonnés après un crosspoint.
-    frames = [body] + [_matrix_body(p, m) for p, m in matrix_map.items()]
+def _send_frames(frames):
+    """Envoie une suite de frames à tous les abonnés ; retire ceux dont le socket est mort."""
     with _lock:
         dead = []
         for s in list(_subscribed):
@@ -419,17 +419,52 @@ def _broadcast_full_tree():
         for s in dead:
             _subscribed.discard(s)
 
+def _diff_elements(old, new):
+    """Compare deux index {chemin: élément} → (structure_changée, [éléments modifiés]).
+
+    Un chemin ajouté ou retiré est STRUCTUREL : le consumer doit revoir l'arbre, on lui
+    renvoie tout. À chemins constants, seuls les éléments dont le tuple diffère sont à
+    repousser — un élément porte sa valeur ET son libellé, donc l'égalité de tuples suffit."""
+    if old.keys() != new.keys():
+        return True, []
+    return False, [el for p, el in new.items() if old.get(p) != el]
+
+def _broadcast_update():
+    """Rediffuse aux abonnés le STRICT nécessaire.
+
+    L'arbre entier n'est réémis que si sa structure a changé (chemin ajouté/retiré : arrivée
+    ou départ d'un device, ré-affectation, édition du profil). Sinon on n'émet que les
+    éléments dont la valeur a bougé — la collection Ember+ étant plate et à chemins absolus,
+    un sous-ensemble EST une trame de mise à jour valide. Et si rien n'a bougé, on n'envoie
+    rien : l'ancien comportement rediffusait tout l'arbre même à valeurs identiques."""
+    with _tree_lock:
+        old = dict(_tree_cache.get("elements") or {})
+        primed = _tree_cache.get("body") is not None
+    try:
+        body, _, matrix_map = _current_tree(force=True)
+    except Exception as e:
+        log.error("emberplus: build arbre échoué : %s", e)
+        return
+    with _tree_lock:
+        new = dict(_tree_cache.get("elements") or {})
+    structural, changed = _diff_elements(old, new) if primed else (True, [])
+    if structural:
+        # Racine (nœuds/params + matrices contents-seuls) PUIS chaque matrice complète, pour
+        # que les tallies de connexions remontent aux abonnés après un crosspoint.
+        frames = [body] + [_matrix_body(p, m) for p, m in matrix_map.items()]
+    elif changed:
+        frames = [glow.build_collection(changed)]
+    else:
+        return
+    if glow.DEBUG:
+        log.info("emberplus: broadcast %s (%d élément(s))",
+                 "arbre complet" if structural else "incrémental", len(changed))
+    _send_frames(frames)
+
 def _broadcast_matrix(mpath, m):
     """Envoie IMMÉDIATEMENT (sans débounce) la frame d'UNE matrice aux abonnés — fait remonter
     le tally d'un crosspoint à VSM sans attendre une reconstruction d'arbre."""
-    frame = _matrix_body(list(mpath), m)
-    with _lock:
-        dead = []
-        for s in list(_subscribed):
-            if not _send_frame(s, frame):
-                dead.append(s)
-        for s in dead:
-            _subscribed.discard(s)
+    _send_frames([_matrix_body(list(mpath), m)])
 
 def notify_change():
     """Broadcast aux abonnés. Débounce : max 1 / NOTIFY_DEBOUNCE_S."""
@@ -444,7 +479,7 @@ def notify_change():
         def _fire():
             global _notify_timer, _notify_pending
             try:
-                _broadcast_full_tree()
+                _broadcast_update()
             finally:
                 with _lock:
                     _notify_timer = None
