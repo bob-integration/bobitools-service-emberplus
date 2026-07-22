@@ -46,6 +46,9 @@ IPG_ROOT_ID = 1000
 
 NOTIFY_DEBOUNCE_S = 1.0        # max 1 broadcast / seconde
 TREE_TTL_S = 5.0               # ré-agrégation de l'arbre au plus toutes les 5 s
+PUSH_INTERVAL_DEFAULT_S = 5    # cadence du pousseur périodique (réglage emberplus_push_interval)
+PUSH_INTERVAL_MIN_S = 1        # bornes de garde : un intervalle absurde ne doit pas noyer le parc
+PUSH_INTERVAL_MAX_S = 3600
 TREE_CALL_TIMEOUT_S = 4        # garde-fou : un contributeur lent à `ember/tree` est sauté
                               # (502 → ignoré) ; ses nœuds reviendront au prochain tour.
 
@@ -69,6 +72,7 @@ _lock = threading.Lock()
 _clients = set()               # connexions actives
 _subscribed = set()            # sockets ayant souscrit au broadcast
 _server_thread = None
+_push_thread = None            # pousseur périodique (cf. _push_loop)
 _server_socket = None
 _running = False
 _notify_timer = None
@@ -591,20 +595,54 @@ def _server_loop(port):
         _status["running"] = False
     log.info("emberplus: serveur arrêté")
 
+def _push_interval():
+    """Cadence du pousseur, bornée : un réglage absurde ne doit pas noyer les contributeurs."""
+    try:
+        v = int(settings.get("emberplus_push_interval") or PUSH_INTERVAL_DEFAULT_S)
+    except (TypeError, ValueError):
+        v = PUSH_INTERVAL_DEFAULT_S
+    return max(PUSH_INTERVAL_MIN_S, min(PUSH_INTERVAL_MAX_S, v))
+
+
+def _push_loop():
+    """Ré-agrège périodiquement et pousse CE QUI A CHANGÉ aux abonnés.
+
+    Sans cela le provider ne reconstruit son arbre que sur sollicitation : un consumer qui
+    reste sur une page voit des valeurs figées, et ne découvre les changements qu'en
+    renavigant (constaté sur VSM). On ne travaille que s'il Y A des abonnés — sinon la
+    ré-agrégation, qui interroge chaque contributeur en HTTP, serait pure dépense.
+    Le coût par tick est faible : `_broadcast_update` n'émet que le delta, et rien du tout
+    si rien n'a bougé."""
+    while _running:
+        time.sleep(_push_interval())
+        if not _running:
+            break
+        with _lock:
+            has_subs = bool(_subscribed)
+        if not has_subs:
+            continue
+        try:
+            notify_change()          # débouncé : se fond avec les autres déclencheurs
+        except Exception as e:
+            log.debug("emberplus: push périodique échoué : %s", e)
+
+
 def start(port):
     """Démarre (ou redémarre) le serveur sur `port`."""
-    global _server_thread, _running
+    global _server_thread, _push_thread, _running
     stop()
     _running = True
     _server_thread = threading.Thread(target=_server_loop, args=(int(port),), daemon=True)
     _server_thread.start()
+    _push_thread = threading.Thread(target=_push_loop, daemon=True)
+    _push_thread.start()
 
 def stop():
     """Arrête le serveur ; ferme les clients."""
-    global _running, _server_thread
+    global _running, _server_thread, _push_thread
     if not _running:
         return
-    _running = False
+    _running = False       # le pousseur sort de sa boucle au prochain réveil
     with _lock:
         for sock in list(_clients):
             try: sock.close()
@@ -617,6 +655,7 @@ def stop():
     if _server_thread:
         _server_thread.join(timeout=2)
     _server_thread = None
+    _push_thread = None    # daemon : pas de join, il dort peut-être tout l'intervalle
     with _lock:
         _status["running"] = False
 
