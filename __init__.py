@@ -47,6 +47,15 @@ IPG_ROOT_ID = 1000
 # par-plugin (1..k) et de la racine IPG : aucun risque de collision.
 SERVICE_ROOT_ID = 1001
 _VERSION_CACHE = None          # version lue une fois dans le manifeste (cf. _service_version)
+_last_push_ts = None           # horodatage de la dernière trame réellement émise
+
+# Paramètres du nœud de service dont la valeur bouge TOUTE SEULE (horloge). Ils sont exclus
+# de la détection de changement : sinon chaque tick produirait un delta, et le silence à état
+# stable — la raison d'être de la diffusion incrémentale — serait perdu. Cas de la « dernière
+# poussée », qui s'AUTO-ENTRETIENT : pousser met à jour l'horodatage, donc le tick suivant voit
+# une différence, donc pousse à nouveau, indéfiniment. Ces valeurs restent émises dès qu'un
+# changement RÉEL survient, et sont fraîches à chaque GetDirectory.
+VOLATILE_SERVICE_PATHS = {(SERVICE_ROOT_ID, 6), (SERVICE_ROOT_ID, 10)}
 
 NOTIFY_DEBOUNCE_S = 1.0        # max 1 broadcast / seconde
 TREE_TTL_S = 5.0               # ré-agrégation de l'arbre au plus toutes les 5 s
@@ -382,6 +391,9 @@ def _append_service_node(elements, path_map):
     # s'exécute AVANT nous, donc le chiffre est exact et non décalé d'un cycle.
     slots = len({tuple(el[0])[1] for el in elements
                  if len(el[0]) >= 2 and el[0][0] == IPG_ROOT_ID})
+    # Compté sur l'agrégation en cours, + 1 : la cadence ci-dessous est le seul paramètre
+    # inscriptible du nœud de service. Sert à repérer d'un coup d'œil un `writable` mal posé.
+    nwrit = sum(1 for el in elements if el[1] == "param" and len(el) > 6 and el[6]) + 1
     _ensure_node(elements, set(), [SERVICE_ROOT_ID], "Service Ember+")
     # Identifiant seul, description vide — comme tous les autres paramètres de l'arbre :
     # VÉRIFIÉ, VSM recopie l'identifiant faute de description, donc un champ suffit.
@@ -402,6 +414,11 @@ def _append_service_node(elements, path_map):
                      glow.PT_INTEGER, False))
     elements.append(([SERVICE_ROOT_ID, 9], "param", "Dernière erreur", "",
                      str(err) if err else "—", glow.PT_STRING, False))
+    elements.append(([SERVICE_ROOT_ID, 10], "param", "Dernière poussée", "",
+                     time.strftime("%H:%M:%S", time.localtime(_last_push_ts))
+                     if _last_push_ts else "—", glow.PT_STRING, False))
+    elements.append(([SERVICE_ROOT_ID, 11], "param", "Paramètres inscriptibles", "",
+                     nwrit, glow.PT_INTEGER, False))
 
 
 def _apply_service_setvalue(path, value):
@@ -550,7 +567,10 @@ def _diff_elements(old, new):
     repousser — un élément porte sa valeur ET son libellé, donc l'égalité de tuples suffit."""
     if old.keys() != new.keys():
         return True, []
-    return False, [el for p, el in new.items() if old.get(p) != el]
+    changed = [p for p in new if old.get(p) != new[p]]
+    if changed and all(p in VOLATILE_SERVICE_PATHS for p in changed):
+        return False, []          # seules des valeurs « horloge » ont bougé → on se tait
+    return False, [new[p] for p in changed]
 
 def _broadcast_update():
     """Rediffuse aux abonnés le STRICT nécessaire.
@@ -582,6 +602,8 @@ def _broadcast_update():
     if glow.DEBUG:
         log.info("emberplus: broadcast %s (%d élément(s))",
                  "arbre complet" if structural else "incrémental", len(changed))
+    global _last_push_ts
+    _last_push_ts = time.time()
     _send_frames(frames)
 
 def _broadcast_matrix(mpath, m):
