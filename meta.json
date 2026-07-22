@@ -1,5 +1,5 @@
 {
-  "version": "0.5.0",
+  "version": "0.5.1",
   "published_at": "2026-07-22",
   "changes": {
     "Nouveautés": [
@@ -11,7 +11,9 @@
       "Provider générique : agrège les sous-arbres `ember/tree` des outils, encode Glow, route SetValue/Connect via un `ref` opaque.",
       "Matrice VLAN (switch_ports) validée sur Lawo VSM ; tally crosspoint immédiat sans reconstruction complète de l'arbre."
     ],
-    "Corrections": [],
+    "Corrections": [
+      "Nœud « Service Ember+ » : la description de la cadence affichait « secondes », peu parlante au pupitre — remplacée par « update interval (s) »."
+    ],
     "Bugs connus": []
   }
 }
