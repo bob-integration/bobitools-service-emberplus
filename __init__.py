@@ -104,7 +104,7 @@ _status = {
 # de comparaison pour n'émettre que ce qui a bougé (cf. _broadcast_update).
 _tree_lock = threading.Lock()
 _tree_cache = {"ts": 0.0, "body": None, "path_map": {}, "matrix_map": {}, "contributors": [],
-               "elements": {}}
+               "elements": {}, "elements_list": None}
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -314,27 +314,52 @@ def _build_tree():
         _append_service_node(elements, path_map)
     except Exception as e:
         log.warning("emberplus: nœud de service échoué : %s", e)
-    extras = [_encode_matrix(p, m, with_axes=False) for p, m in matrix_map.items()]
-    body = glow.build_collection(elements, extra=extras)
     # Index par chemin : base de la comparaison incrémentale. Un élément porte à la fois sa
     # valeur et son libellé, donc comparer les tuples suffit à détecter tout ce qui bouge.
     el_index = {tuple(el[0]): el for el in elements}
-    return body, path_map, matrix_map, contributors, el_index
+    # PAS d'encodage ici : la comparaison n'a besoin que de l'index. Le corps encodé ne sert
+    # qu'à répondre à un GetDirectory ou à pousser un arbre complet, cas rares — l'encoder à
+    # chaque cycle coûtait des centaines de ms pour rien sur un gros arbre (cf. _encoded_body).
+    return elements, path_map, matrix_map, contributors, el_index
 
-def _current_tree(force=False):
-    """Renvoie (body, path_map, matrix_map), ré-agrégeant si cache expiré ou forcé."""
+
+def _encoded_body():
+    """Corps racine encodé, calculé À LA DEMANDE et mémoïsé jusqu'à la prochaine agrégation.
+    Contient nœuds/params + matrices en CONTENTS-SEULS (annonce sans le payload, pour éviter
+    la déconnexion VSM ; les axes/connexions viennent au GetDirectory)."""
+    with _tree_lock:
+        if _tree_cache.get("body") is not None:
+            return _tree_cache["body"]
+        elements = _tree_cache.get("elements_list") or []
+        matrix_map = _tree_cache.get("matrix_map") or {}
+    extras = [_encode_matrix(p, m, with_axes=False) for p, m in matrix_map.items()]
+    body = glow.build_collection(elements, extra=extras)
+    with _tree_lock:
+        _tree_cache["body"] = body
+    return body
+
+def _reaggregate(force=False):
+    """Ré-agrège si le cache est expiré ou si `force`. N'ENCODE RIEN : le corps n'est produit
+    qu'à la demande par `_encoded_body()`. Renvoie (path_map, matrix_map)."""
     with _tree_lock:
         fresh = (time.monotonic() - _tree_cache["ts"]) < TREE_TTL_S
-        if not force and fresh and _tree_cache["body"] is not None:
-            return _tree_cache["body"], _tree_cache["path_map"], _tree_cache["matrix_map"]
-    body, path_map, matrix_map, contributors, el_index = _build_tree()
+        if not force and fresh and _tree_cache.get("elements_list") is not None:
+            return _tree_cache["path_map"], _tree_cache["matrix_map"]
+    elements, path_map, matrix_map, contributors, el_index = _build_tree()
     with _tree_lock:
-        _tree_cache.update({"ts": time.monotonic(), "body": body, "path_map": path_map,
+        _tree_cache.update({"ts": time.monotonic(), "body": None, "path_map": path_map,
                             "matrix_map": matrix_map, "contributors": contributors,
-                            "elements": el_index})
+                            "elements": el_index, "elements_list": elements})
     with _lock:
         _status["contributors"] = contributors
-    return body, path_map, matrix_map
+    return path_map, matrix_map
+
+
+def _current_tree(force=False):
+    """Renvoie (body, path_map, matrix_map). Le corps est encodé à la demande — n'appeler
+    que lorsqu'on en a réellement besoin (GetDirectory, push d'arbre complet)."""
+    path_map, matrix_map = _reaggregate(force)
+    return _encoded_body(), path_map, matrix_map
 
 def _invalidate():
     with _tree_lock:
@@ -470,7 +495,7 @@ def _apply_service_setvalue(path, value):
 def _apply_setvalue(path, value):
     if _apply_service_setvalue(path, value):     # paramètres du service, avant tout routage
         return True
-    _, path_map, _ = _current_tree()
+    path_map, _ = _reaggregate()        # tables seules : pas besoin d'encoder l'arbre
     entry = path_map.get(tuple(path))
     if not entry:
         log.info("emberplus: setvalue %s ignoré (inconnu ou lecture seule)", path)
@@ -514,7 +539,7 @@ def _reload_matrix(type_, mpath):
 
 def _apply_connect(matrix_path, target, sources, operation):
     """Route un crosspoint (consumer→provider) vers l'outil propriétaire de la matrice."""
-    _, _, matrix_map = _current_tree()
+    _, matrix_map = _reaggregate()      # tables seules : pas besoin d'encoder l'arbre
     m = matrix_map.get(tuple(matrix_path))
     if not m:
         log.info("emberplus: connect %s ignoré (matrice inconnue)", matrix_path)
@@ -599,9 +624,12 @@ def _broadcast_update():
     rien : l'ancien comportement rediffusait tout l'arbre même à valeurs identiques."""
     with _tree_lock:
         old = dict(_tree_cache.get("elements") or {})
-        primed = _tree_cache.get("body") is not None
+        # Amorçage testé sur l'INDEX, surtout pas sur `body` : depuis l'encodage différé
+        # celui-ci est presque toujours None, ce qui ferait passer chaque cycle pour un
+        # premier passage — donc un arbre complet à chaque fois.
+        primed = _tree_cache.get("elements_list") is not None
     try:
-        body, _, matrix_map = _current_tree(force=True)
+        _, matrix_map = _reaggregate(force=True)        # ré-agrège SANS encoder
     except Exception as e:
         log.error("emberplus: build arbre échoué : %s", e)
         return
@@ -611,7 +639,9 @@ def _broadcast_update():
     if structural:
         # Racine (nœuds/params + matrices contents-seuls) PUIS chaque matrice complète, pour
         # que les tallies de connexions remontent aux abonnés après un crosspoint.
-        frames = [body] + [_matrix_body(p, m) for p, m in matrix_map.items()]
+        # L'encodage complet n'a lieu QUE dans ce cas : sur un tick ordinaire, seuls les
+        # éléments modifiés sont encodés, ce qui rend la taille de l'arbre indolore.
+        frames = [_encoded_body()] + [_matrix_body(p, m) for p, m in matrix_map.items()]
     elif changed:
         frames = [glow.build_collection(changed)]
     else:
