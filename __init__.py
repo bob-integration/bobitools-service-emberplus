@@ -43,9 +43,15 @@ EMBER_ACTOR = "Service Ember+"
 # distincte des racines par-plugin (1..k) : garantit un chemin VSM stable quels que soient
 # les plugins activés. Structure sous cette racine : [IPG, slot, voie, bloc, param].
 IPG_ROOT_ID = 1000
+# Racine du nœud de service (le provider s'expose lui-même). Distincte des racines
+# par-plugin (1..k) et de la racine IPG : aucun risque de collision.
+SERVICE_ROOT_ID = 1001
 
 NOTIFY_DEBOUNCE_S = 1.0        # max 1 broadcast / seconde
 TREE_TTL_S = 5.0               # ré-agrégation de l'arbre au plus toutes les 5 s
+PUSH_INTERVAL_DEFAULT_S = 5    # cadence du pousseur périodique (réglage emberplus_push_interval)
+PUSH_INTERVAL_MIN_S = 1        # bornes de garde : un intervalle absurde ne doit pas noyer le parc
+PUSH_INTERVAL_MAX_S = 3600
 TREE_CALL_TIMEOUT_S = 4        # garde-fou : un contributeur lent à `ember/tree` est sauté
                               # (502 → ignoré) ; ses nœuds reviendront au prochain tour.
 
@@ -69,6 +75,7 @@ _lock = threading.Lock()
 _clients = set()               # connexions actives
 _subscribed = set()            # sockets ayant souscrit au broadcast
 _server_thread = None
+_push_thread = None            # pousseur périodique (cf. _push_loop)
 _server_socket = None
 _running = False
 _notify_timer = None
@@ -228,19 +235,25 @@ def _append_canonical(elements, path_map, contributors):
                 continue
             seen.add(tuple(ppath))
             ptype = _TYPE_MAP.get(res["type"], glow.PT_STRING)
+            writable = bool(res.get("writable", True))
             value = b.get("value")
+            minimum, maximum = res.get("min"), res.get("max")
             if res["type"] == "enum":
                 try:
                     value = int(value or 0)
                 except (TypeError, ValueError):
                     value = 0
-                el = (ppath, "param", res["param_label"], "", value, ptype, True)
-                if res["enum"]:                 # n'émet une énumération que si des libellés existent
-                    el = el + (res["enum"],)
-            else:
-                el = (ppath, "param", res["param_label"], "", value, ptype, True)
+            el = (ppath, "param", res["param_label"], "", value, ptype, writable)
+            enumeration = res["enum"] if (res["type"] == "enum" and res["enum"]) else None
+            # `enumeration` doit être ajouté (même None) dès qu'une borne suit : c'est la
+            # forme positionnelle attendue par `_encode_element` (cf. emberplus_glow.py) —
+            # sans quoi min/max se retrouveraient au mauvais index.
+            if enumeration is not None or minimum is not None or maximum is not None:
+                el = el + (enumeration,)
+            if minimum is not None or maximum is not None:
+                el = el + (minimum, maximum)
             elements.append(el)
-            if b.get("ref") is not None:
+            if writable and b.get("ref") is not None:
                 path_map[tuple(ppath)] = (type_, b.get("ref"))
     contributors.append({"type": "ipg", "label": "%s (%d slot%s)" % (
         prof.get("label") or "IPG", len(slots), "s" if len(slots) > 1 else "")})
@@ -276,6 +289,10 @@ def _build_tree():
         _append_canonical(elements, path_map, contributors)
     except Exception as e:
         log.warning("emberplus: agrégation canonique (IPG) échouée : %s", e)
+    try:
+        _append_service_node(elements, path_map)
+    except Exception as e:
+        log.warning("emberplus: nœud de service échoué : %s", e)
     extras = [_encode_matrix(p, m, with_axes=False) for p, m in matrix_map.items()]
     body = glow.build_collection(elements, extra=extras)
     # Index par chemin : base de la comparaison incrémentale. Un élément porte à la fois sa
@@ -309,10 +326,65 @@ def refresh():
 
 
 # ═════════════════════════════════════════════════════════════════════
+# Nœud « Service Ember+ » : le provider s'expose lui-même
+# ═════════════════════════════════════════════════════════════════════
+
+def _append_service_node(elements, path_map):
+    """Monte le nœud de service : cadence de poussée (réglable DEPUIS le pupitre) et
+    quelques compteurs de diagnostic en lecture seule.
+
+    La cadence est AUTO-RÉFÉRENTE — elle règle l'intervalle auquel elle est elle-même
+    repoussée. Sans danger grâce aux bornes annoncées (1 s–1 h), qui font refuser une
+    saisie absurde par le consumer lui-même plutôt qu'après coup. Ce paramètre
+    n'appartient à aucun outil : il n'entre donc PAS dans `path_map` (qui route vers un
+    plugin) et son écriture est interceptée en amont par `_apply_service_setvalue`."""
+    with _lock:
+        nsub, ncli = len(_subscribed), len(_clients)
+        contribs = ", ".join(c.get("type", "") for c in _status.get("contributors") or [])
+    _ensure_node(elements, set(), [SERVICE_ROOT_ID], "Service Ember+")
+    # Identifiant seul, description vide — comme tous les autres paramètres de l'arbre :
+    # VÉRIFIÉ, VSM recopie l'identifiant faute de description, donc un champ suffit.
+    elements.append(([SERVICE_ROOT_ID, 1], "param", "update interval (s)", "",
+                     _push_interval(), glow.PT_INTEGER, True, None,
+                     PUSH_INTERVAL_MIN_S, PUSH_INTERVAL_MAX_S))
+    elements.append(([SERVICE_ROOT_ID, 2], "param", "Abonnés", "", nsub, glow.PT_INTEGER, False))
+    elements.append(([SERVICE_ROOT_ID, 3], "param", "Clients", "", ncli, glow.PT_INTEGER, False))
+    elements.append(([SERVICE_ROOT_ID, 4], "param", "Contributeurs", "", contribs,
+                     glow.PT_STRING, False))
+
+
+def _apply_service_setvalue(path, value):
+    """Intercepte une écriture sur le nœud de service. Renvoie True si le chemin lui
+    appartient (traité ou refusé), False pour laisser le routage normal opérer."""
+    p = tuple(path)
+    if not p or p[0] != SERVICE_ROOT_ID:
+        return False
+    if p == (SERVICE_ROOT_ID, 1):
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            log.info("emberplus: cadence refusée (valeur %r non entière)", value)
+            return True
+        if not (PUSH_INTERVAL_MIN_S <= v <= PUSH_INTERVAL_MAX_S):
+            log.info("emberplus: cadence %s hors bornes %d–%d, refusée",
+                     v, PUSH_INTERVAL_MIN_S, PUSH_INTERVAL_MAX_S)
+            return True
+        settings.set("emberplus_push_interval", v)
+        audit_log("emberplus", "push_interval", "%s s" % v, user_id=None, username=EMBER_ACTOR)
+        log.info("emberplus: cadence de poussée portée à %s s depuis le pupitre", v)
+        refresh()
+        return True
+    log.info("emberplus: setvalue %s ignoré (paramètre de service en lecture seule)", path)
+    return True
+
+
+# ═════════════════════════════════════════════════════════════════════
 # Application d'un SetValue → routage vers l'outil propriétaire
 # ═════════════════════════════════════════════════════════════════════
 
 def _apply_setvalue(path, value):
+    if _apply_service_setvalue(path, value):     # paramètres du service, avant tout routage
+        return True
     _, path_map, _ = _current_tree()
     entry = path_map.get(tuple(path))
     if not entry:
@@ -590,20 +662,54 @@ def _server_loop(port):
         _status["running"] = False
     log.info("emberplus: serveur arrêté")
 
+def _push_interval():
+    """Cadence du pousseur, bornée : un réglage absurde ne doit pas noyer les contributeurs."""
+    try:
+        v = int(settings.get("emberplus_push_interval") or PUSH_INTERVAL_DEFAULT_S)
+    except (TypeError, ValueError):
+        v = PUSH_INTERVAL_DEFAULT_S
+    return max(PUSH_INTERVAL_MIN_S, min(PUSH_INTERVAL_MAX_S, v))
+
+
+def _push_loop():
+    """Ré-agrège périodiquement et pousse CE QUI A CHANGÉ aux abonnés.
+
+    Sans cela le provider ne reconstruit son arbre que sur sollicitation : un consumer qui
+    reste sur une page voit des valeurs figées, et ne découvre les changements qu'en
+    renavigant (constaté sur VSM). On ne travaille que s'il Y A des abonnés — sinon la
+    ré-agrégation, qui interroge chaque contributeur en HTTP, serait pure dépense.
+    Le coût par tick est faible : `_broadcast_update` n'émet que le delta, et rien du tout
+    si rien n'a bougé."""
+    while _running:
+        time.sleep(_push_interval())
+        if not _running:
+            break
+        with _lock:
+            has_subs = bool(_subscribed)
+        if not has_subs:
+            continue
+        try:
+            notify_change()          # débouncé : se fond avec les autres déclencheurs
+        except Exception as e:
+            log.debug("emberplus: push périodique échoué : %s", e)
+
+
 def start(port):
     """Démarre (ou redémarre) le serveur sur `port`."""
-    global _server_thread, _running
+    global _server_thread, _push_thread, _running
     stop()
     _running = True
     _server_thread = threading.Thread(target=_server_loop, args=(int(port),), daemon=True)
     _server_thread.start()
+    _push_thread = threading.Thread(target=_push_loop, daemon=True)
+    _push_thread.start()
 
 def stop():
     """Arrête le serveur ; ferme les clients."""
-    global _running, _server_thread
+    global _running, _server_thread, _push_thread
     if not _running:
         return
-    _running = False
+    _running = False       # le pousseur sort de sa boucle au prochain réveil
     with _lock:
         for sock in list(_clients):
             try: sock.close()
@@ -616,6 +722,7 @@ def stop():
     if _server_thread:
         _server_thread.join(timeout=2)
     _server_thread = None
+    _push_thread = None    # daemon : pas de join, il dort peut-être tout l'intervalle
     with _lock:
         _status["running"] = False
 
@@ -650,6 +757,7 @@ def register_routes(bp):
         out = status_dict()
         out["enabled_setting"] = bool(settings.get("emberplus_enabled"))
         out["port_setting"] = int(settings.get("emberplus_port") or 9000)
+        out["push_interval_setting"] = _push_interval()
         return jsonify(out)
 
     @bp.route("/api/emberplus/apply", methods=["POST"])
@@ -660,13 +768,23 @@ def register_routes(bp):
         port = int(data.get("port") or 9000)
         if not (1 <= port <= 65535):
             return jsonify({"error": "port invalide"}), 400
+        push = data.get("push_interval")
+        if push is not None:
+            try:
+                push = int(push)
+            except (TypeError, ValueError):
+                return jsonify({"error": "cadence invalide"}), 400
+            if not (PUSH_INTERVAL_MIN_S <= push <= PUSH_INTERVAL_MAX_S):
+                return jsonify({"error": "cadence hors bornes (%d–%d s)"
+                                % (PUSH_INTERVAL_MIN_S, PUSH_INTERVAL_MAX_S)}), 400
+            settings.set("emberplus_push_interval", push)
         settings.set("emberplus_enabled", enabled)
         settings.set("emberplus_port", port)
         if enabled:
             start(port)
         else:
             stop()
-        _audit_log("emberplus", "apply", f"enabled={enabled} port={port}",
+        _audit_log("emberplus", "apply", f"enabled={enabled} port={port} push={_push_interval()}",
                    user_id=None, username="système")
         return jsonify(status_dict())
 

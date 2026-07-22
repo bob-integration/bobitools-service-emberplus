@@ -16,7 +16,16 @@ Structure d'un profil :
       "blocks": [ { "key": str, "label": str, "id": int,
                     "params": [ { "key": str, "label": str, "id": int,
                                   "type": "string|int|real|bool|enum",
-                                  "unit"?: str, "enum"?: [str] } ] } ] }
+                                  "unit"?: str, "enum"?: [str],
+                                  "writable"?: bool,
+                                  "min"?: number, "max"?: number } ] } ] }
+Le drapeau optionnel "writable" (défaut True si absent) déclare si le paramètre est
+inscriptible côté VSM (SetValue autorisé) ; à False pour un statut en lecture seule
+(verrouillage, présence de signal, PTP, voie affectée…).
+Les bornes optionnelles "min"/"max" (nombres) déclarent l'intervalle valide côté device
+(ex. retard image 0..226) : transmises à VSM (PC_MINIMUM/PC_MAXIMUM) pour empêcher la
+saisie d'une valeur hors plage côté pupitre. Absentes → aucune borne annoncée ; `build_index`
+renvoie alors `None` (à distinguer d'une borne valant 0).
 
 Le contenu par défaut ci-dessous est PROVISOIRE (« NAP vidéo » minimal) : il valide
 le mécanisme. Le catalogue définitif viendra de l'analyse croisée SNP/Neuron, et sera
@@ -40,6 +49,22 @@ _VIDEO_FORMATS = [
     "1080p50", "1080p5994", "1080p60", "1080p25", "1080p2997", "1080p30", "1080p24", "1080p2398",
     "2160p50", "2160p5994", "2160p60", "2160p25", "2160p2997", "2160p30", "2160p24", "2160p2398",
     "720p50", "720p5994", "720p60",
+]
+
+# Enum canonique des motifs de mire : relevé RÉEL sur un SNP (Imagine Selenio Network
+# Processor), dans cet ordre exact. L'ORDRE DE LA LISTE EST LE CONTRAT : l'index dans la
+# liste est ce que VSM voit et enregistre côté pupitre ; toute valeur future DOIT être
+# ajoutée EN FIN de liste — un réordonnancement casserait les configurations pupitre
+# existantes (même logique que pour `_VIDEO_FORMATS` ci-dessus).
+_TESTPATTERNS = [
+    "Black",
+    "White",
+    "Color Bars 75%",
+    "Horizontal Sweep Y-only",
+    "Horizontal Sweep",
+    "Cross Hatch",
+    "Pathological EQ",
+    "Pathological PLL",
 ]
 
 DEFAULT_PROFILE = {
@@ -67,7 +92,8 @@ DEFAULT_PROFILE = {
             {"key": "freeze", "label": "Gel image", "id": 1, "type": "bool"},
             {"key": "black", "label": "Forçage noir", "id": 2, "type": "bool"},
             {"key": "testpattern", "label": "Mire", "id": 3, "type": "bool"},
-            {"key": "testpattern_sel", "label": "Motif de mire", "id": 4, "type": "string"},
+            {"key": "testpattern_sel", "label": "Motif de mire", "id": 4,
+             "type": "enum", "enum": _TESTPATTERNS},
         ]},
         {"key": "output", "label": "Sortie", "id": 5, "params": [
             {"key": "video_format", "label": "Format vidéo", "id": 1,
@@ -100,7 +126,9 @@ def get_profile():
 
 def build_index(prof=None):
     """Indexe le profil : { "<bloc>.<param>" : {block_id, block_label, param_id,
-    param_label, type, enum} }. Utilisé pour résoudre une clé canonique en `id`."""
+    param_label, type, enum, writable, min, max} }. Utilisé pour résoudre une clé
+    canonique en `id`. `min`/`max` valent `None` quand la borne correspondante est
+    absente du profil (à distinguer d'une borne valant 0)."""
     prof = prof or get_profile()
     idx = {}
     for block in prof.get("blocks") or []:
@@ -117,6 +145,9 @@ def build_index(prof=None):
                 "param_id": int(pid), "param_label": str(p.get("label") or pkey),
                 "type": str(p.get("type") or "string").lower(),
                 "enum": [str(x) for x in (p.get("enum") or [])],
+                "writable": bool(p.get("writable", True)),
+                "min": p.get("min"),
+                "max": p.get("max"),
             }
     return idx
 

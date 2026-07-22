@@ -511,16 +511,27 @@ def _encode_value_explicit(ptype, raw):
         return ber_bool(bool(raw))
     return ber_utf8(str(raw) if raw is not None else "")
 
-def _parameter_contents_set(identifier, description, raw_value, ptype, access, enumeration=None):
+def _parameter_contents_set(identifier, description, raw_value, ptype, access, enumeration=None,
+                            minimum=None, maximum=None):
     """ParameterContents = SET universel (tag 0x31) contenant chaque champ EXPLICIT-taggé.
     Convention Glow.asn (module EXPLICIT TAGS). `enumeration` = liste d'étiquettes ;
-    si fournie, émet PC_ENUMERATION (entrées séparées par '\\n', l'index = la valeur entière)."""
+    si fournie, émet PC_ENUMERATION (entrées séparées par '\\n', l'index = la valeur entière).
+    `minimum`/`maximum` (optionnels, défaut None → pas d'appel existant qui change de
+    comportement) émettent PC_MINIMUM/PC_MAXIMUM quand fournis, encodés dans le MÊME type que
+    la valeur (entier pour PT_INTEGER, réel pour PT_REAL) ; ignorés pour les autres types, où
+    une borne n'a pas de sens."""
     fields = (
         _ctx_explicit(PC_IDENTIFIER,  ber_utf8(identifier)) +
         _ctx_explicit(PC_DESCRIPTION, ber_utf8(description)) +
-        _ctx_explicit(PC_VALUE,       _encode_value_explicit(ptype, raw_value)) +
-        _ctx_explicit(PC_ACCESS,      ber_int(access))
+        _ctx_explicit(PC_VALUE,       _encode_value_explicit(ptype, raw_value))
     )
+    bound_encoder = {PT_INTEGER: ber_int, PT_REAL: ber_real}.get(ptype)
+    if bound_encoder is not None:
+        if minimum is not None:
+            fields += _ctx_explicit(PC_MINIMUM, bound_encoder(minimum))
+        if maximum is not None:
+            fields += _ctx_explicit(PC_MAXIMUM, bound_encoder(maximum))
+    fields += _ctx_explicit(PC_ACCESS, ber_int(access))
     if enumeration:
         fields += _ctx_explicit(PC_ENUMERATION, ber_utf8("\n".join(enumeration)))
     fields += (
@@ -529,9 +540,11 @@ def _parameter_contents_set(identifier, description, raw_value, ptype, access, e
     )
     return _universal_constructed(17, fields)  # SET universel
 
-def _qual_parameter(path, identifier, description, raw_value, ptype, writeable, enumeration=None):
+def _qual_parameter(path, identifier, description, raw_value, ptype, writeable, enumeration=None,
+                    minimum=None, maximum=None):
     access = ACCESS_READWRITE if writeable else ACCESS_READ
-    contents_set = _parameter_contents_set(identifier, description, raw_value, ptype, access, enumeration)
+    contents_set = _parameter_contents_set(identifier, description, raw_value, ptype, access,
+                                           enumeration, minimum, maximum)
     return _app_constructed(G_QUAL_PARAMETER,
         _ctx_explicit(0, ber_relative_oid(path)) +
         _ctx_explicit(1, contents_set))
@@ -558,10 +571,16 @@ def _encode_element(path, kind, *args):
     if kind == 'node':
         identifier, description = args
         return _qual_node(path, identifier, description)
-    # param : (identifier, description, raw_value, ptype, writeable[, enumeration])
+    # param : (identifier, description, raw_value, ptype, writeable[, enumeration[, minimum, maximum]])
+    # `enumeration` doit être présent (même à None) pour que `minimum`/`maximum` soient lus :
+    # c'est la forme produite par `_append_canonical` ; le mode libre (`_walk_node`) ne va
+    # jamais au-delà de `enumeration` et reste donc inchangé.
     identifier, description, raw_value, ptype, writeable = args[:5]
     enumeration = args[5] if len(args) > 5 else None
-    return _qual_parameter(path, identifier, description, raw_value, ptype, writeable, enumeration)
+    minimum = args[6] if len(args) > 6 else None
+    maximum = args[7] if len(args) > 7 else None
+    return _qual_parameter(path, identifier, description, raw_value, ptype, writeable,
+                           enumeration, minimum, maximum)
 
 
 def build_collection(elements, extra=None):
@@ -570,11 +589,12 @@ def build_collection(elements, extra=None):
     chaque élément est un QualifiedNode/QualifiedParameter (chemin absolu RELATIVE-OID),
     structure « plate » que les consumers (VSM, tinyEmber+…) reconstruisent en arbre.
     `extra` : éléments DÉJÀ encodés (bytes) à ajouter (ex. QualifiedMatrix)."""
-    wrapped = b""
+    chunks = []
     for path, kind, *args in elements:
-        wrapped += _ctx_explicit(0, _encode_element(path, kind, *args))
+        chunks.append(_ctx_explicit(0, _encode_element(path, kind, *args)))
     for el in (extra or []):
-        wrapped += _ctx_explicit(0, el)
+        chunks.append(_ctx_explicit(0, el))
+    wrapped = b"".join(chunks)
     rec = _app_constructed(G_ROOT_ELEMENT_COLLECTION, wrapped)
     return _app_constructed(0, rec)  # [App 0] Root wrapper
 
