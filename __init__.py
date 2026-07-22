@@ -342,7 +342,9 @@ def _append_service_node(elements, path_map):
         nsub, ncli = len(_subscribed), len(_clients)
         contribs = ", ".join(c.get("type", "") for c in _status.get("contributors") or [])
     _ensure_node(elements, set(), [SERVICE_ROOT_ID], "Service Ember+")
-    elements.append(([SERVICE_ROOT_ID, 1], "param", "Cadence de poussée", "update interval (s)",
+    # Identifiant seul, description vide — comme tous les autres paramètres de l'arbre :
+    # VÉRIFIÉ, VSM recopie l'identifiant faute de description, donc un champ suffit.
+    elements.append(([SERVICE_ROOT_ID, 1], "param", "update interval (s)", "",
                      _push_interval(), glow.PT_INTEGER, True, None,
                      PUSH_INTERVAL_MIN_S, PUSH_INTERVAL_MAX_S))
     elements.append(([SERVICE_ROOT_ID, 2], "param", "Abonnés", "", nsub, glow.PT_INTEGER, False))

@@ -12,7 +12,7 @@
       "Matrice VLAN (switch_ports) validée sur Lawo VSM ; tally crosspoint immédiat sans reconstruction complète de l'arbre."
     ],
     "Corrections": [
-      "Nœud « Service Ember+ » : la description de la cadence affichait « secondes », peu parlante au pupitre — remplacée par « update interval (s) »."
+      "Nœud « Service Ember+ » : la cadence s'affichait « secondes » au pupitre, ce qui n'apprend rien — l'identifiant devient « update interval (s) », description laissée vide comme partout ailleurs dans l'arbre. Vérifié sur le nœud 1001, qui contenait les deux cas côte à côte : VSM affiche la description quand elle existe et RECOPIE l'identifiant sinon. Les 236 paramètres à description vide, dont les 192 du moule IPG, sont donc déjà lisibles."
     ],
     "Bugs connus": []
   }
