@@ -27,9 +27,14 @@ Les bornes optionnelles "min"/"max" (nombres) déclarent l'intervalle valide cô
 saisie d'une valeur hors plage côté pupitre. Absentes → aucune borne annoncée ; `build_index`
 renvoie alors `None` (à distinguer d'une borne valant 0).
 
-Le contenu par défaut ci-dessous est PROVISOIRE (« NAP vidéo » minimal) : il valide
-le mécanisme. Le catalogue définitif viendra de l'analyse croisée SNP/Neuron, et sera
-éditable en réglages (setting `emberplus_profile`, JSON) sans toucher au code.
+Le catalogue par défaut ci-dessous (v2) est le catalogue FIGÉ, établi sur relevés réels de
+trois familles : Imagine SNP, yellobrik CDE 1922, Ross Newt. Blocs 1-6 = traitement (rempli
+par les processeurs) ; blocs 7-9 = PASSERELLE (source d'entrée, transport IP, statut), commun
+aux convertisseurs SDI↔ST2110. La SÉLECTION de source (quel flux/BNC) reste HORS moule (mode
+libre) : elle n'est pas interchangeable entre familles (cf. EMBERPLUS-IPG.md §10-11). Le
+catalogue reste surchargeable en réglages (setting `emberplus_profile`, JSON) sans toucher au
+code. RÈGLE D'OR : bloc.id et param.id, et l'ordre des enums, ne bougent JAMAIS — on n'ajoute
+qu'en fin ; un id retiré reste vacant (ex. functions.testpattern, id 4.3).
 """
 import json
 import logging
@@ -67,10 +72,29 @@ _TESTPATTERNS = [
     "Pathological PLL",
 ]
 
+# ─── Enums du CATALOGUE PASSERELLE (blocs 7-9) ──────────────────────────
+# Établis sur relevés RÉELS de trois familles : Imagine SNP, yellobrik CDE 1922, Ross Newt.
+# Même règle que les autres enums : l'ORDRE EST LE CONTRAT (index vu par VSM), on n'ajoute
+# qu'EN FIN, jamais au milieu — un réordonnancement casserait les configs pupitre.
+
+# Source d'entrée d'une voie. La mire (générateur interne) est traitée comme une SOURCE, pas
+# comme une fonction : « cette voie est une mire » est un choix de source côté opérateur.
+# `Mixte` est un état LU (sur un SNP, une section dont les 4 programmes divergent) — VSM peut
+# l'afficher mais l'opérateur ne le sélectionne pas. La SÉLECTION de source (quel BNC, quel
+# flux/SDP) N'EST PAS dans le moule : elle reste au mode libre car non interchangeable entre
+# familles (adresse multicast côté SNP, crosspoint côté routeur, cf. EMBERPLUS-IPG.md §10-11).
+_INPUT_MODES = ["Désactivé", "SDI", "IP", "Mire", "Mixte"]
+# Mode de transport IP (SNP VidRxMode ; SDP Newt SSN=ST2110-20).
+_TRANSPORT_MODES = ["ST 2110", "ST 2022-6"]
+# Mise en forme du trafic ST 2110-21 (CDE PRS ; SDP TP=2110TPN/TPW). Narrow/Wide/Linear.
+_TRAFFIC_SHAPE = ["Narrow", "Wide", "Linear"]
+# État de synchronisation PTP (CDE PtpLockStatus locked/freerun ; SNP ptpCtlrState).
+_PTP_STATES = ["Non synchro", "Synchro", "Holdover"]
+
 DEFAULT_PROFILE = {
-    "version": 1,
-    "label": "NAP vidéo",
-    "lanes": 32,                      # voies logiques 1..32 (Neuron A1..H4 ; SNP 4 proc × 8 prog HD)
+    "version": 2,                     # v2 : catalogue passerelle figé (blocs 7-9)
+    "label": "IPG",                   # IP Gateway — racine affichée au pupitre
+    "lanes": 32,                      # indicatif : la taille réelle du vivier est réglée à part
     "blocks": [
         {"key": "channel", "label": "Voie", "id": 1, "params": [
             {"key": "enable", "label": "Voie active", "id": 1, "type": "bool"},
@@ -88,10 +112,13 @@ DEFAULT_PROFILE = {
             {"key": "h_phase", "label": "Phase H", "id": 2, "type": "int"},
             {"key": "v_phase", "label": "Phase V", "id": 3, "type": "int"},
         ]},
+        # ⚠ Bloc 4 : le paramètre `testpattern` (id 3, « Mire » on/off) a été RETIRÉ — la mire
+        # est désormais une valeur de `gateway.input_mode` (bloc 7). L'id 3 reste VACANT et ne
+        # doit JAMAIS être réattribué : le retrait ne renumérote rien (freeze=1, black=2,
+        # testpattern_sel=4 gardent leur id), sinon les chemins VSM casseraient.
         {"key": "functions", "label": "Fonctions", "id": 4, "params": [
             {"key": "freeze", "label": "Gel image", "id": 1, "type": "bool"},
             {"key": "black", "label": "Forçage noir", "id": 2, "type": "bool"},
-            {"key": "testpattern", "label": "Mire", "id": 3, "type": "bool"},
             {"key": "testpattern_sel", "label": "Motif de mire", "id": 4,
              "type": "enum", "enum": _TESTPATTERNS},
         ]},
@@ -99,10 +126,28 @@ DEFAULT_PROFILE = {
             {"key": "video_format", "label": "Format vidéo", "id": 1,
              "type": "enum", "enum": _VIDEO_FORMATS},
             {"key": "media_type", "label": "Type de média", "id": 2,
-             "type": "enum", "enum": ["SDI", "ST 2110", "NMOS"]},   # provisoire (Neuron only)
+             "type": "enum", "enum": ["SDI", "ST 2110", "NMOS"]},
         ]},
         {"key": "audio", "label": "Audio", "id": 6, "params": [
             {"key": "delay", "label": "Retard audio", "id": 1, "type": "int", "unit": "ms"},
+        ]},
+        # ─── Catalogue PASSERELLE (blocs 7-9) — commun aux convertisseurs SDI↔ST2110 ───
+        {"key": "gateway", "label": "Passerelle", "id": 7, "params": [
+            {"key": "input_mode", "label": "Source d'entrée", "id": 1,
+             "type": "enum", "enum": _INPUT_MODES},
+        ]},
+        {"key": "transport", "label": "Transport IP", "id": 8, "params": [
+            {"key": "mode", "label": "Mode", "id": 1, "type": "enum", "enum": _TRANSPORT_MODES},
+            {"key": "redundancy", "label": "Redondance ST 2022-7", "id": 2, "type": "bool"},
+            {"key": "traffic_shape", "label": "Mise en forme trafic", "id": 3,
+             "type": "enum", "enum": _TRAFFIC_SHAPE},
+        ]},
+        # Statut : LECTURE SEULE (writable:false) — présence signal, verrouillage, PTP.
+        {"key": "status", "label": "Statut", "id": 9, "params": [
+            {"key": "signal", "label": "Signal présent", "id": 1, "type": "bool", "writable": False},
+            {"key": "lock", "label": "Verrouillé", "id": 2, "type": "bool", "writable": False},
+            {"key": "ptp", "label": "PTP", "id": 3, "type": "enum", "enum": _PTP_STATES,
+             "writable": False},
         ]},
     ],
 }
