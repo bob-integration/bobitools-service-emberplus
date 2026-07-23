@@ -20,6 +20,14 @@
     "emberplus_push_interval": {
       "type": "int",
       "default": 5
+    },
+    "emberplus_lanes_count": {
+      "type": "int",
+      "default": 256
+    },
+    "emberplus_lanes": {
+      "type": "text",
+      "default": {}
     }
   }
 }

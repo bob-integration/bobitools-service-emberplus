@@ -46,6 +46,14 @@ IPG_ROOT_ID = 1000
 # Racine du nœud de service (le provider s'expose lui-même). Distincte des racines
 # par-plugin (1..k) et de la racine IPG : aucun risque de collision.
 SERVICE_ROOT_ID = 1001
+# Bloc « identité de voie », monté par le SERVICE (hors profil). id réservé, très au-dessus des
+# blocs du catalogue (1..k) : décrit à qui une voie est affectée, en lecture seule.
+IDENTITY_BLOCK_ID = 100
+# Vivier de voies : nombre de voies TOUJOURS émises (grille pleine), réglable. Voir §11.1 de
+# EMBERPLUS-IPG.md. Agrandir est sûr (ajout en fin) ; rétrécir casse les chemins au-delà.
+LANES_COUNT_DEFAULT = 256
+LANES_COUNT_MIN = 1
+LANES_COUNT_MAX = 1024
 _VERSION_CACHE = None          # version lue une fois dans le manifeste (cf. _service_version)
 _last_push_ts = None           # horodatage de la dernière trame réellement émise
 
@@ -193,25 +201,112 @@ def _ensure_node(elements, seen, path, label):
     seen.add(key)
     elements.append((list(path), "node", str(label), ""))
 
+def _num_lanes():
+    """Taille du vivier de voies (grille pleine), bornée. Réglage `emberplus_lanes_count`."""
+    try:
+        v = int(settings.get("emberplus_lanes_count") or LANES_COUNT_DEFAULT)
+    except (TypeError, ValueError):
+        v = LANES_COUNT_DEFAULT
+    return max(LANES_COUNT_MIN, min(LANES_COUNT_MAX, v))
+
+
+def _lane_registry():
+    """Affectation persistée { voie:int -> (type, slot, lane) } (réglage `emberplus_lanes`).
+    C'est LA source de vérité du plan de numérotation VSM : une fois posée, une affectation
+    ne bouge plus, sinon les chemins câblés au pupitre casseraient."""
+    raw = settings.get("emberplus_lanes")
+    out = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                out[int(k)] = (str(v["type"]), int(v["slot"]), int(v["lane"]))
+            except (TypeError, ValueError, KeyError):
+                continue
+    return out
+
+
+def _save_lane_registry(reg):
+    settings.set("emberplus_lanes",
+                 {str(voie): {"type": t, "slot": s, "lane": l}
+                  for voie, (t, s, l) in reg.items()})
+
+
+def _assign_lanes(channels):
+    """Résout chaque canal (type, slot, lane locale) en une voie du vivier. COLLANT : un canal
+    déjà connu garde sa voie ; un canal nouveau prend la première voie libre et l'affectation
+    est persistée. Ainsi l'arrivée d'un device ne décale jamais les voies déjà attribuées."""
+    reg = _lane_registry()
+    inv = {ch: voie for voie, ch in reg.items()}
+    nmax = _num_lanes()
+    used = set(reg)
+    changed = False
+    for ch in sorted(channels):
+        if ch in inv:
+            continue
+        for voie in range(1, nmax + 1):
+            if voie not in used:
+                reg[voie] = ch; inv[ch] = voie; used.add(voie); changed = True
+                break
+    if changed:
+        try:
+            _save_lane_registry(reg)
+        except Exception as e:
+            log.warning("emberplus: sauvegarde de l'affectation des voies échouée : %s", e)
+    return reg
+
+
+_CANON_DEFAULTS = {"bool": False, "boolean": False, "int": 0, "integer": 0,
+                   "real": 0.0, "float": 0.0, "enum": 0}
+
+
+def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maximum):
+    """Émet un paramètre canonique (forme positionnelle enum/bornes de `_encode_element`) et,
+    s'il est inscriptible ET porte un `ref`, l'inscrit dans `path_map` (routage du SetValue)."""
+    ptype = _TYPE_MAP.get(res["type"], glow.PT_STRING)
+    writable = bool(res.get("writable", True))
+    if res["type"] == "enum":
+        try:
+            value = int(value or 0)
+        except (TypeError, ValueError):
+            value = 0
+    el = (ppath, "param", res["param_label"], "", value, ptype, writable)
+    enumeration = res["enum"] if (res["type"] == "enum" and res["enum"]) else None
+    # `enumeration` doit précéder les bornes, même à None : forme positionnelle attendue.
+    if enumeration is not None or minimum is not None or maximum is not None:
+        el = el + (enumeration,)
+    if minimum is not None or maximum is not None:
+        el = el + (minimum, maximum)
+    elements.append(el)
+    if writable and ref is not None:
+        path_map[tuple(ppath)] = ref
+
+
 def _append_canonical(elements, path_map, contributors):
-    """Voie CANONIQUE (« moule IPG ») : agrège les `ember/bindings` de tous les outils,
-    bucketise par slot logique, et monte l'arbre sous la racine IPG avec la numérotation
-    FIGÉE du profil → arbre identique quel que soit le device backing un slot.
+    """Voie CANONIQUE (« moule IPG »), modèle VIVIER. La racine 1000 porte un nombre FIXE de
+    voies (grille pleine, `_num_lanes`), chacune émettant TOUT le catalogue du profil — qu'un
+    device y soit affecté ou non. Ainsi VSM peut être configuré avant qu'un équipement soit
+    présent, et un swap de device ne change JAMAIS la forme de l'arbre.
+
+        1000 / <voie 1..N> / <bloc.id> / <param.id>
+
+    Chaque voie porte aussi un bloc « identité » (id réservé, lecture seule) disant à quel
+    device/canal elle est affectée. L'affectation voie ↔ canal vit dans le service
+    (`_lane_registry`), pas dans les plugins : la numérotation EST le contrat VSM.
 
     Contrat plugin (GET ember/bindings) :
         { "devices": [ { "slot": int, "label"?: str,
                          "bindings": [ { "key": "<bloc>.<param>", "lane"?: int,
                                          "value": <v>, "ref": <opaque>,
                                          "min"?: number, "max"?: number }, ... ] } ] }
-    Un outil qui n'implémente pas la route (status != 200) est simplement ignoré.
-    `min`/`max` sont OPTIONNELLES et prioritaires sur celles du profil : une borne décrit le
-    matériel, pas le catalogue canonique — deux familles montées sur le même slot n'ont pas
-    les mêmes limites."""
+    Un outil qui ne répond pas 200 est ignoré. `min`/`max` (binding) priment sur le profil :
+    une borne décrit le matériel, pas le catalogue commun à toutes les familles."""
     prof = _profile.get_profile()
     index = _profile.build_index(prof)
+    nlanes = _num_lanes()
 
-    # slot -> { "label": str|None, "bindings": [ (type_, binding), ... ] }
-    slots = {}
+    # 1. Collecte des bindings, indexés par CANAL = (type, slot, lane locale du device).
+    channels = {}        # (type, slot, lane) -> { canon_key: binding }
+    dev_labels = {}      # (type, slot) -> label lisible du device
     for type_ in _bindings_types():
         status, data = tools.call(type_, "ember/bindings", "GET", actor=EMBER_ACTOR,
                                   timeout=TREE_CALL_TIMEOUT_S)
@@ -221,63 +316,64 @@ def _append_canonical(elements, path_map, contributors):
             slot = dev.get("slot")
             if slot is None:
                 continue
-            entry = slots.setdefault(int(slot), {"label": None, "bindings": []})
-            if dev.get("label") and not entry["label"]:
-                entry["label"] = str(dev["label"])
+            slot = int(slot)
+            if dev.get("label"):
+                dev_labels.setdefault((type_, slot), str(dev["label"]))
             for b in dev.get("bindings") or []:
-                entry["bindings"].append((type_, b))
-    if not slots:
-        return
+                ch = (type_, slot, int(b.get("lane") or 1))
+                channels.setdefault(ch, {})[b.get("key")] = b
 
+    # 2. Affectation collante voie ↔ canal (persistée, jamais décalée).
+    reg = _assign_lanes(set(channels))
+
+    # 3. Grille pleine : les N voies émettent toujours tout le catalogue.
     seen = set()
     _ensure_node(elements, seen, [IPG_ROOT_ID], prof.get("label") or "IPG")
-    for slot in sorted(slots):
-        entry = slots[slot]
-        _ensure_node(elements, seen, [IPG_ROOT_ID, slot],
-                     entry["label"] or ("Slot %d" % slot))
-        for type_, b in entry["bindings"]:
-            res = index.get(b.get("key"))
-            if not res:
-                log.info("emberplus: binding %r inconnu au profil (ignoré)", b.get("key"))
+    for voie in range(1, nlanes + 1):
+        ch = reg.get(voie)
+        binds = channels.get(ch, {}) if ch else {}
+        _ensure_node(elements, seen, [IPG_ROOT_ID, voie], "Voie %d" % voie)
+
+        # Bloc identité (hors profil) : à qui la voie est affectée, en lecture seule.
+        _ensure_node(elements, seen, [IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID], "Voie")
+        dev = (dev_labels.get((ch[0], ch[1])) or ch[0]) if ch else ""
+        native = ("slot %d · voie %d" % (ch[1], ch[2])) if ch else ""
+        elements.append(([IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID, 1], "param", "Affectée", "",
+                         ch is not None, glow.PT_BOOLEAN, False))
+        elements.append(([IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID, 2], "param", "Équipement", "",
+                         dev, glow.PT_STRING, False))
+        elements.append(([IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID, 3], "param", "Canal natif", "",
+                         native, glow.PT_STRING, False))
+
+        # Catalogue complet du profil, dans l'ordre. Une voie affectée remplit ce que le device
+        # expose (valeur + ref → pilotable) ; le reste, et toute voie libre, tombe au défaut.
+        for block in prof.get("blocks") or []:
+            bkey, bid, blabel = block.get("key"), block.get("id"), block.get("label")
+            if not bkey or bid is None:
                 continue
-            lane = int(b.get("lane") or 1)
-            _ensure_node(elements, seen, [IPG_ROOT_ID, slot, lane], "Voie %d" % lane)
-            _ensure_node(elements, seen, [IPG_ROOT_ID, slot, lane, res["block_id"]],
-                         res["block_label"])
-            ppath = [IPG_ROOT_ID, slot, lane, res["block_id"], res["param_id"]]
-            if tuple(ppath) in seen:            # collision (2 devices sur un même slot) → 1er gagne
-                log.warning("emberplus: chemin canonique %s en double (binding %r ignoré)",
-                            ppath, b.get("key"))
-                continue
-            seen.add(tuple(ppath))
-            ptype = _TYPE_MAP.get(res["type"], glow.PT_STRING)
-            writable = bool(res.get("writable", True))
-            value = b.get("value")
-            # Bornes : celles du BINDING l'emportent. Une borne est une caractéristique du
-            # matériel (0..226 trames pour ce SNP), pas du catalogue canonique, qui est commun
-            # à toutes les familles ; le profil ne sert donc que de repli, pour une limite
-            # réellement universelle.
-            minimum = b.get("min") if b.get("min") is not None else res.get("min")
-            maximum = b.get("max") if b.get("max") is not None else res.get("max")
-            if res["type"] == "enum":
-                try:
-                    value = int(value or 0)
-                except (TypeError, ValueError):
-                    value = 0
-            el = (ppath, "param", res["param_label"], "", value, ptype, writable)
-            enumeration = res["enum"] if (res["type"] == "enum" and res["enum"]) else None
-            # `enumeration` doit être ajouté (même None) dès qu'une borne suit : c'est la
-            # forme positionnelle attendue par `_encode_element` (cf. emberplus_glow.py) —
-            # sans quoi min/max se retrouveraient au mauvais index.
-            if enumeration is not None or minimum is not None or maximum is not None:
-                el = el + (enumeration,)
-            if minimum is not None or maximum is not None:
-                el = el + (minimum, maximum)
-            elements.append(el)
-            if writable and b.get("ref") is not None:
-                path_map[tuple(ppath)] = (type_, b.get("ref"))
-    contributors.append({"type": "ipg", "label": "%s (%d slot%s)" % (
-        prof.get("label") or "IPG", len(slots), "s" if len(slots) > 1 else "")})
+            _ensure_node(elements, seen, [IPG_ROOT_ID, voie, bid], blabel or bkey)
+            for p in block.get("params") or []:
+                pkey, pid = p.get("key"), p.get("id")
+                if not pkey or pid is None:
+                    continue
+                res = index.get("%s.%s" % (bkey, pkey))
+                if not res:
+                    continue
+                b = binds.get("%s.%s" % (bkey, pkey))
+                if b is not None:
+                    value = b.get("value")
+                    minimum = b.get("min") if b.get("min") is not None else res.get("min")
+                    maximum = b.get("max") if b.get("max") is not None else res.get("max")
+                    ref = (ch[0], b.get("ref")) if b.get("ref") is not None else None
+                else:
+                    value = _CANON_DEFAULTS.get(res["type"], "")
+                    minimum, maximum = res.get("min"), res.get("max")
+                    ref = None
+                _emit_canon_param(elements, path_map,
+                                  [IPG_ROOT_ID, voie, bid, pid], res, value, ref, minimum, maximum)
+
+    contributors.append({"type": "ipg", "label": "%s (%d voies, %d affectée%s)" % (
+        prof.get("label") or "IPG", nlanes, len(reg), "s" if len(reg) != 1 else "")})
 
 def _build_tree():
     """Agrège les sous-arbres : (body racine, path_map, matrix_map, contributors).
@@ -429,10 +525,10 @@ def _append_service_node(elements, path_map):
         port = int(_status.get("port") or 0)
         started = _status.get("started_at")
         err = _status.get("last_error")
-    # Slots du moule montés : compté sur ce qui vient d'être agrégé — `_append_canonical`
-    # s'exécute AVANT nous, donc le chiffre est exact et non décalé d'un cycle.
-    slots = len({tuple(el[0])[1] for el in elements
-                 if len(el[0]) >= 2 and el[0][0] == IPG_ROOT_ID})
+    # Voies du vivier : total (taille du vivier) et affectées (registre). Le total sert de
+    # repère au pupitre ; les affectées disent combien de canaux réels sont mappés.
+    nlanes = _num_lanes()
+    nassigned = sum(1 for v in _lane_registry() if 1 <= v <= nlanes)
     # Compté sur l'agrégation en cours, + 1 : la cadence ci-dessous est le seul paramètre
     # inscriptible du nœud de service. Sert à repérer d'un coup d'œil un `writable` mal posé.
     nwrit = sum(1 for el in elements if el[1] == "param" and len(el) > 6 and el[6]) + 1
@@ -452,8 +548,8 @@ def _append_service_node(elements, path_map):
     elements.append(([SERVICE_ROOT_ID, 6], "param", "Uptime", "",
                      _uptime_str(started), glow.PT_STRING, False))
     elements.append(([SERVICE_ROOT_ID, 7], "param", "Port", "", port, glow.PT_INTEGER, False))
-    elements.append(([SERVICE_ROOT_ID, 8], "param", "Slots IPG", "", slots,
-                     glow.PT_INTEGER, False))
+    elements.append(([SERVICE_ROOT_ID, 8], "param", "Voies (affectées / total)", "",
+                     "%d / %d" % (nassigned, nlanes), glow.PT_STRING, False))
     elements.append(([SERVICE_ROOT_ID, 9], "param", "Dernière erreur", "",
                      str(err) if err else "—", glow.PT_STRING, False))
     elements.append(([SERVICE_ROOT_ID, 10], "param", "Dernière poussée", "",
@@ -878,6 +974,7 @@ def register_routes(bp):
         out["enabled_setting"] = bool(settings.get("emberplus_enabled"))
         out["port_setting"] = int(settings.get("emberplus_port") or 9000)
         out["push_interval_setting"] = _push_interval()
+        out["lanes_count_setting"] = _num_lanes()
         return jsonify(out)
 
     @bp.route("/api/emberplus/apply", methods=["POST"])
@@ -898,6 +995,17 @@ def register_routes(bp):
                 return jsonify({"error": "cadence hors bornes (%d–%d s)"
                                 % (PUSH_INTERVAL_MIN_S, PUSH_INTERVAL_MAX_S)}), 400
             settings.set("emberplus_push_interval", push)
+        lanes = data.get("lanes_count")
+        if lanes is not None:
+            try:
+                lanes = int(lanes)
+            except (TypeError, ValueError):
+                return jsonify({"error": "nombre de voies invalide"}), 400
+            if not (LANES_COUNT_MIN <= lanes <= LANES_COUNT_MAX):
+                return jsonify({"error": "nombre de voies hors bornes (%d–%d)"
+                                % (LANES_COUNT_MIN, LANES_COUNT_MAX)}), 400
+            settings.set("emberplus_lanes_count", lanes)
+            refresh()          # la taille du vivier change la STRUCTURE → réémettre l'arbre
         settings.set("emberplus_enabled", enabled)
         settings.set("emberplus_port", port)
         if enabled:
