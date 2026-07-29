@@ -1,17 +1,16 @@
 {
-  "version": "0.13.0",
+  "version": "0.14.0",
   "published_at": "2026-07-29",
   "changes": {
     "Nouveautés": [
-      "PLAN DES RACINES RÉORGANISÉ, avec des réserves larges. Les paires de grilles deviennent contiguës et se lisent en bloc : 1010 affectation IPG ↔ slot, 1011/1012 vidéo, 1013/1014 audio, 1015/1016 ancillaire, 1100 arbre des SDP. Les plages 1002-1009 et 1017-1099 sont RÉSERVÉES, pour qu'une essence de plus ou un futur arbre de paramètres s'insère sans jamais renuméroter. Arrêté le 2026-07-29, alors qu'aucun VSM n'était encore câblé — c'était le seul moment où ce plan restait reprenable (renuméroter une racine casse tous les chemins câblés au pupitre, §12.2)."
+      "CATALOGUE ENRICHI depuis les relevés du Neuron réel : `output.wire_mode` (5.3) et `gateway.input_wire` (7.2), enum [« 1 lien (12G) », « 4 liens (3G) »] — en quad, une voie UHD occupe QUATRE connecteurs physiques ; et `status.input_valid` (9.4), chaîne en lecture seule, où le matériel publie son propre verdict en comparant le signal réel au mode déclaré. Ajouts EN FIN de bloc, aucun id renuméroté. Le mode UHD n'a délibérément PAS de paramètre : il est dérivé du format vidéo, et l'écrire directement est refusé par le matériel."
     ],
     "Corrections": [
-      "DÉLAI D'ÉCRITURE SÉPARÉ DU DÉLAI DE LECTURE. `ember/connect` héritait des 4 s prévus pour les lectures, alors qu'un crosspoint touche plusieurs objets du matériel — 4 programmes pour une section de SNP, 8 canaux pour une essence audio de Neuron. Le tout premier crosspoint réel a été perdu sur un « Read timed out (4 s) », soit le pire cas : le service croit avoir échoué alors que le matériel a peut-être appliqué. (Vérifié après un cycle de poll complet : il n'avait effectivement rien écrit.) Les écritures disposent désormais de 30 s.",
-      "UN CONTRIBUTEUR MUET NE FAIT PLUS DISPARAÎTRE SON SOUS-ARBRE. Mesuré : le `ember/tree` du SNP met 4 à 9 s pour 687 ko et débordait donc une fois sur deux du délai de 4 s — tout son sous-arbre en mode libre s'évanouissait du pupitre, matrice « Entrées (SDI/IP) » comprise, tandis que son `ember/io` (23 ms) continuait d'alimenter les grilles, ce qui rendait la panne discrète. Le délai passe à 10 s ET le dernier sous-arbre connu est rejoué quand un contributeur échoue, signalé par « (dernier état connu) » dans la liste des contributeurs. Un nœud qui s'évanouit est bien pire qu'un nœud en retard : VSM perd ses chemins et l'opérateur croit le matériel absent."
+      "LE RÉGLAGE DE PROFIL MASQUAIT LE CATALOGUE DU CODE. `emberplus_profile` contenait un profil v1 (blocs 1-6) et `get_profile()` préférait toujours la surcharge : le catalogue passerelle des blocs 7-9, livré en 0.10.0 et réputé fait, n'avait JAMAIS tourné sur cette instance. C'est le piège de l'image Docker périmée transposé aux réglages — une surcharge posée une fois gèle le catalogue pour toujours, sans que rien ne le signale. Une surcharge de version inférieure à celle du code est désormais ignorée, avec un avertissement dit UNE SEULE FOIS (get_profile est appelé toutes les 5 s : journalisé sans garde, il noyait le journal et se rendait invisible à force d'être répété). L'ignorer est sûr par construction : la règle d'or du catalogue veut qu'on n'ajoute qu'en fin, donc une version plus récente est toujours un surensemble."
     ],
     "Bugs connus": [
-      "Aucune ÉCRITURE n'a encore traversé la chaîne complète VSM → service → ember/connect → matériel, sur aucune famille.",
-      "Le moule (racine 1000) reste creux sur cette instance : ember/bindings rend 0 device, l'exposition canonique n'ayant jamais été configurée (§6)."
+      "Le catalogue v2 réellement actif fait passer le GetDirectory complet de 1,16 à 2,18 Mo (26 818 éléments, 16 slots × 32 voies). Les deltas restent minuscules ; c'est le coût d'une première connexion. Si le parc grandit, ce sont les bornes d'émission (slots × voies) qu'il faudra rediscuter.",
+      "Aucune écriture n'a encore traversé la chaîne complète VSM → service → ember/connect → matériel."
     ]
   }
 }

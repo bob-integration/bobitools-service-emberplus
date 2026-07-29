@@ -41,6 +41,8 @@ import logging
 
 log = logging.getLogger(__name__)
 
+_STALE_WARNED = False   # cf. get_profile : l'alerte de profil périmé n'est dite qu'une fois
+
 # ─── Profil par défaut « NAP vidéo » ────────────────────────────────────
 # Union des blocs curatés SNP + Neuron ; chaque device remplit ce qu'il expose (ou
 # qu'on lui mappe). Le routage de source est HORS profil (géré par la matrice, phase 2).
@@ -49,6 +51,11 @@ log = logging.getLogger(__name__)
 # Enum canonique des formats de sortie : liste PROVISOIRE, à recaler sur un relevé device
 # réel (`GET /neurons/{id}/object/{oid}` → options, et MetaData SNP). L'ordre = l'index vu
 # par VSM ; chaque plugin fournit un enum_map (index canonique → valeur native).
+# Câblage d'une voie UHD : un seul lien 12G, ou quatre liens 3G (la voie occupe alors quatre
+# connecteurs). Relevé sur le Neuron (`Wire Mode In` / `Wire Mode Out`, valeurs 1 et 4).
+# ORDRE = CONTRAT : ajouter en fin, jamais au milieu.
+_WIRE_MODES = ["1 lien (12G)", "4 liens (3G)"]
+
 _VIDEO_FORMATS = [
     "1080i50", "1080i5994", "1080i60",
     "1080p50", "1080p5994", "1080p60", "1080p25", "1080p2997", "1080p30", "1080p24", "1080p2398",
@@ -127,6 +134,8 @@ DEFAULT_PROFILE = {
              "type": "enum", "enum": _VIDEO_FORMATS},
             {"key": "media_type", "label": "Type de média", "id": 2,
              "type": "enum", "enum": ["SDI", "ST 2110", "NMOS"]},
+            {"key": "wire_mode", "label": "Câblage sortie", "id": 3, "type": "enum",
+             "enum": _WIRE_MODES},
         ]},
         {"key": "audio", "label": "Audio", "id": 6, "params": [
             {"key": "delay", "label": "Retard audio", "id": 1, "type": "int", "unit": "ms"},
@@ -135,7 +144,14 @@ DEFAULT_PROFILE = {
         {"key": "gateway", "label": "Passerelle", "id": 7, "params": [
             {"key": "input_mode", "label": "Source d'entrée", "id": 1,
              "type": "enum", "enum": _INPUT_MODES},
+            {"key": "input_wire", "label": "Câblage entrée", "id": 2, "type": "enum",
+             "enum": _WIRE_MODES},
         ]},
+        # ⚠ `wire_mode` : relevé sur le Neuron le 2026-07-29. Une voie UHD peut sortir sur UN
+        # lien 12G ou sur QUATRE liens 3G — dans le second cas elle occupe quatre connecteurs
+        # physiques. L'ordre de cet enum est le contrat (index vu par VSM) : ajouter en FIN.
+        # Le mode UHD lui-même n'est PAS un paramètre : il est DÉRIVÉ du format (l'écrire
+        # directement est refusé par le matériel), et `video_format` le dit déjà.
         {"key": "transport", "label": "Transport IP", "id": 8, "params": [
             {"key": "mode", "label": "Mode", "id": 1, "type": "enum", "enum": _TRANSPORT_MODES},
             {"key": "redundancy", "label": "Redondance ST 2022-7", "id": 2, "type": "bool"},
@@ -148,22 +164,57 @@ DEFAULT_PROFILE = {
             {"key": "lock", "label": "Verrouillé", "id": 2, "type": "bool", "writable": False},
             {"key": "ptp", "label": "PTP", "id": 3, "type": "enum", "enum": _PTP_STATES,
              "writable": False},
+            # Le matériel compare le SIGNAL RÉEL au mode déclaré et publie son verdict —
+            # relevé sur le Neuron (`Input Mode Validity` : « OK », « Warning » quand la
+            # source n'est pas UHD alors que la voie l'est). Volontairement une CHAÎNE et non
+            # un enum : on n'a aucune liste exhaustive des libellés, et un enum incomplet
+            # retomberait silencieusement sur l'index 0 (cf. §5). On relaie le mot du device.
+            {"key": "input_valid", "label": "Validité de l'entrée", "id": 4, "type": "string",
+             "writable": False},
         ]},
     ],
 }
 
 
 def get_profile():
-    """Renvoie le profil courant : le JSON du réglage `emberplus_profile` s'il est
-    valide, sinon le profil par défaut du code (fallback → une MAJ du DEFAULT_PROFILE
-    se propage tant que l'opérateur n'a rien surchargé)."""
+    """Renvoie le profil courant : le JSON du réglage `emberplus_profile` s'il est valide ET
+    PAS PÉRIMÉ, sinon le profil par défaut du code.
+
+    ⚠ GARDE-FOU AJOUTÉ LE 2026-07-29, sur un cas réel. Le réglage masquait un profil **v1**
+    (blocs 1-6 seulement) alors que le code portait la v2 depuis emberplus 0.10.0 : le
+    « catalogue passerelle figé » (blocs 7-9) n'avait donc JAMAIS tourné sur cette instance,
+    silencieusement — exactement le piège de l'image Docker périmée (§1.1), transposé aux
+    réglages. Une surcharge posée une fois gelait le catalogue pour toujours.
+
+    Un profil de version INFÉRIEURE à celle du code est donc ignoré, et l'ignorer est SÛR par
+    construction : la règle d'or du catalogue veut qu'on n'ajoute qu'en fin et qu'aucun id ne
+    bouge, donc une version plus récente est toujours un SURENSEMBLE de l'ancienne — aucun
+    chemin VSM existant ne peut casser. À version égale ou supérieure, la surcharge gagne : on
+    ne défait pas une personnalisation volontaire."""
     from app import settings
     raw = settings.get("emberplus_profile")
     if raw:
         try:
             p = raw if isinstance(raw, dict) else json.loads(raw)
             if isinstance(p, dict) and isinstance(p.get("blocks"), list) and p["blocks"]:
-                return p
+                try:
+                    pv = int(p.get("version") or 0)
+                except (TypeError, ValueError):
+                    pv = 0
+                dv = int(DEFAULT_PROFILE.get("version") or 0)
+                if pv < dv:
+                    # UNE SEULE FOIS : `get_profile()` est appelé à chaque ré-agrégation, donc
+                    # toutes les 5 s. Journalisé sans garde, l'avertissement noyait le journal
+                    # et se rendait invisible à force d'être répété.
+                    global _STALE_WARNED
+                    if not _STALE_WARNED:
+                        _STALE_WARNED = True
+                        log.warning("emberplus: profil réglage v%s PÉRIMÉ (le code est en v%s) → "
+                                    "surcharge ignorée. Les blocs ajoutés depuis reviennent dans "
+                                    "l'arbre ; réenregistrer le profil dans Réglages → Ember+ "
+                                    "repartira de la v%s.", pv, dv, dv)
+                else:
+                    return p
         except Exception as e:
             log.warning("emberplus: profil réglage invalide (%s) → défaut", e)
     return DEFAULT_PROFILE
