@@ -32,6 +32,7 @@ from app import settings, tools
 from app import plugins as _plugins
 from app.database import audit_log
 from . import emberplus_glow as glow
+from . import ipg_io
 from . import profile as _profile
 
 log = logging.getLogger(__name__)
@@ -39,9 +40,11 @@ log = logging.getLogger(__name__)
 # Acteur virtuel attribué dans l'audit pour toute modification venant d'Ember+.
 EMBER_ACTOR = "Service Ember+"
 
-# Racine FIXE du « moule IPG » (mode canonique, monté par slot). Valeur haute et stable,
-# distincte des racines par-plugin (1..k) : garantit un chemin VSM stable quels que soient
-# les plugins activés. Structure sous cette racine : [IPG, slot, voie, bloc, param].
+# Racine FIXE du « moule IPG » (mode canonique). Valeur haute et stable, distincte des racines
+# par-plugin (1..k) : garantit un chemin VSM stable quels que soient les plugins activés.
+# Structure sous cette racine : [IPG, voie, bloc, param], où la voie est ADRESSÉE PAR SLOT —
+# `100×slot + n° local` (§12.2). Une voie ne s'attribue donc plus, elle se calcule : le
+# registre collant d'antan a disparu, et avec lui sa dérive (cf. §12.9.4).
 IPG_ROOT_ID = 1000
 # Racine du nœud de service (le provider s'expose lui-même). Distincte des racines
 # par-plugin (1..k) et de la racine IPG : aucun risque de collision.
@@ -49,11 +52,6 @@ SERVICE_ROOT_ID = 1001
 # Bloc « identité de voie », monté par le SERVICE (hors profil). id réservé, très au-dessus des
 # blocs du catalogue (1..k) : décrit à qui une voie est affectée, en lecture seule.
 IDENTITY_BLOCK_ID = 100
-# Vivier de voies : nombre de voies TOUJOURS émises (grille pleine), réglable. Voir §11.1 de
-# EMBERPLUS-IPG.md. Agrandir est sûr (ajout en fin) ; rétrécir casse les chemins au-delà.
-LANES_COUNT_DEFAULT = 256
-LANES_COUNT_MIN = 1
-LANES_COUNT_MAX = 1024
 _VERSION_CACHE = None          # version lue une fois dans le manifeste (cf. _service_version)
 _last_push_ts = None           # horodatage de la dernière trame réellement émise
 
@@ -69,11 +67,19 @@ VOLATILE_SERVICE_PATHS = {(SERVICE_ROOT_ID, 10)}
 
 NOTIFY_DEBOUNCE_S = 1.0        # max 1 broadcast / seconde
 TREE_TTL_S = 5.0               # ré-agrégation de l'arbre au plus toutes les 5 s
+IO_TTL_S = 15.0                # cadence PROPRE à `ember/io`, plus lente que l'arbre : avec les
+                               # essences, la collecte pèse 260 ko pour un seul SNP (quatre SDP
+                               # par signal), soit plusieurs Mo sur un parc chargé. La refaire à
+                               # chaque reconstruction serait du gaspillage — un SDP bouge
+                               # rarement. Le tally après crosspoint n'en dépend PAS : il passe
+                               # par `ipg_io.reload_type`, qui court-circuite ce cache.
 PUSH_INTERVAL_DEFAULT_S = 5    # cadence du pousseur périodique (réglage emberplus_push_interval)
 PUSH_INTERVAL_MIN_S = 1        # bornes de garde : un intervalle absurde ne doit pas noyer le parc
 PUSH_INTERVAL_MAX_S = 3600
-TREE_CALL_TIMEOUT_S = 4        # garde-fou : un contributeur lent à `ember/tree` est sauté
-                              # (502 → ignoré) ; ses nœuds reviendront au prochain tour.
+TREE_CALL_TIMEOUT_S = 10       # garde-fou : un contributeur lent à `ember/tree` est sauté.
+                               # Porté de 4 à 10 s le 2026-07-29 : le SNP met 4 à 9 s pour
+                               # 687 ko et débordait une fois sur deux. Le dépassement n'efface
+                               # plus rien pour autant, cf. `_subtree_cache`.
 
 # Mapping type déclaratif → type de paramètre Glow.
 _TYPE_MAP = {
@@ -111,8 +117,14 @@ _status = {
 # `elements` {tuple(path): élément} est l'index de la DERNIÈRE agrégation : il sert de point
 # de comparaison pour n'émettre que ce qui a bougé (cf. _broadcast_update).
 _tree_lock = threading.Lock()
+# Dernier sous-arbre CONNU par contributeur, {(type, index racine): (éléments, path_map,
+# matrix_map, label)}. Sert de repli quand `ember/tree` échoue ou déborde du délai : mesuré le
+# 2026-07-29, le `ember/tree` du SNP met 4 à 9 s pour 687 ko et sautait donc une fois sur deux,
+# faisant disparaître tout son sous-arbre du pupitre.
+_subtree_cache = {}
+
 _tree_cache = {"ts": 0.0, "body": None, "path_map": {}, "matrix_map": {}, "contributors": [],
-               "elements": {}, "elements_list": None}
+               "elements": {}, "elements_list": None, "io": None, "io_ts": 0.0}
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -201,60 +213,6 @@ def _ensure_node(elements, seen, path, label):
     seen.add(key)
     elements.append((list(path), "node", str(label), ""))
 
-def _num_lanes():
-    """Taille du vivier de voies (grille pleine), bornée. Réglage `emberplus_lanes_count`."""
-    try:
-        v = int(settings.get("emberplus_lanes_count") or LANES_COUNT_DEFAULT)
-    except (TypeError, ValueError):
-        v = LANES_COUNT_DEFAULT
-    return max(LANES_COUNT_MIN, min(LANES_COUNT_MAX, v))
-
-
-def _lane_registry():
-    """Affectation persistée { voie:int -> (type, slot, lane) } (réglage `emberplus_lanes`).
-    C'est LA source de vérité du plan de numérotation VSM : une fois posée, une affectation
-    ne bouge plus, sinon les chemins câblés au pupitre casseraient."""
-    raw = settings.get("emberplus_lanes")
-    out = {}
-    if isinstance(raw, dict):
-        for k, v in raw.items():
-            try:
-                out[int(k)] = (str(v["type"]), int(v["slot"]), int(v["lane"]))
-            except (TypeError, ValueError, KeyError):
-                continue
-    return out
-
-
-def _save_lane_registry(reg):
-    settings.set("emberplus_lanes",
-                 {str(voie): {"type": t, "slot": s, "lane": l}
-                  for voie, (t, s, l) in reg.items()})
-
-
-def _assign_lanes(channels):
-    """Résout chaque canal (type, slot, lane locale) en une voie du vivier. COLLANT : un canal
-    déjà connu garde sa voie ; un canal nouveau prend la première voie libre et l'affectation
-    est persistée. Ainsi l'arrivée d'un device ne décale jamais les voies déjà attribuées."""
-    reg = _lane_registry()
-    inv = {ch: voie for voie, ch in reg.items()}
-    nmax = _num_lanes()
-    used = set(reg)
-    changed = False
-    for ch in sorted(channels):
-        if ch in inv:
-            continue
-        for voie in range(1, nmax + 1):
-            if voie not in used:
-                reg[voie] = ch; inv[ch] = voie; used.add(voie); changed = True
-                break
-    if changed:
-        try:
-            _save_lane_registry(reg)
-        except Exception as e:
-            log.warning("emberplus: sauvegarde de l'affectation des voies échouée : %s", e)
-    return reg
-
-
 _CANON_DEFAULTS = {"bool": False, "boolean": False, "int": 0, "integer": 0,
                    "real": 0.0, "float": 0.0, "enum": 0}
 
@@ -281,7 +239,7 @@ def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maxim
         path_map[tuple(ppath)] = ref
 
 
-def _append_canonical(elements, path_map, contributors):
+def _append_canonical(elements, path_map, contributors, io_state):
     """Voie CANONIQUE (« moule IPG »), modèle VIVIER. La racine 1000 porte un nombre FIXE de
     voies (grille pleine, `_num_lanes`), chacune émettant TOUT le catalogue du profil — qu'un
     device y soit affecté ou non. Ainsi VSM peut être configuré avant qu'un équipement soit
@@ -290,11 +248,12 @@ def _append_canonical(elements, path_map, contributors):
         1000 / <voie 1..N> / <bloc.id> / <param.id>
 
     Chaque voie porte aussi un bloc « identité » (id réservé, lecture seule) disant à quel
-    device/canal elle est affectée. L'affectation voie ↔ canal vit dans le service
-    (`_lane_registry`), pas dans les plugins : la numérotation EST le contrat VSM.
+    device/canal elle est affectée. La voie ne s'attribue plus : elle se CALCULE depuis le
+    slot (§12.9.4), donc un device qui en remplace un autre sur le même slot hérite
+    exactement de ses voies — ce que le slot promettait sans le tenir jusqu'ici.
 
     Contrat plugin (GET ember/bindings) :
-        { "devices": [ { "slot": int, "label"?: str,
+        { "devices": [ { "device": str, "slot"?: int, "label"?: str,
                          "bindings": [ { "key": "<bloc>.<param>", "lane"?: int,
                                          "value": <v>, "ref": <opaque>,
                                          "min"?: number, "max"?: number }, ... ] } ] }
@@ -302,78 +261,129 @@ def _append_canonical(elements, path_map, contributors):
     une borne décrit le matériel, pas le catalogue commun à toutes les familles."""
     prof = _profile.get_profile()
     index = _profile.build_index(prof)
-    nlanes = _num_lanes()
+    nslots, nlanes = ipg_io.num_slots(), ipg_io.lanes_per_slot()
+    slots = (io_state or {}).get("slots") or {}
+    # Devices connus par `ember/io`, indexés par slot : ils portent l'identité d'une voie même
+    # quand ils ne contribuent aucune clé canonique.
+    io_devices = {s: (io_state.get("devices") or {}).get(k)
+                  for s, k in ((io_state or {}).get("by_slot") or {}).items()}
 
-    # 1. Collecte des bindings, indexés par CANAL = (type, slot, lane locale du device).
-    channels = {}        # (type, slot, lane) -> { canon_key: binding }
-    dev_labels = {}      # (type, slot) -> label lisible du device
+    # 1. Collecte des bindings, indexés par (slot, voie locale) — le slot vient du REGISTRE
+    #    (le service est autoritaire, §12.8) ; celui que déclare le plugin n'est qu'un repli,
+    #    utile tant qu'un contributeur n'expose pas encore `ember/io`.
+    channels = {}        # (slot, lane) -> { canon_key: binding }
+    dev_labels = {}      # slot -> label lisible du device
     for type_ in _bindings_types():
         status, data = tools.call(type_, "ember/bindings", "GET", actor=EMBER_ACTOR,
                                   timeout=TREE_CALL_TIMEOUT_S)
         if status != 200 or not isinstance(data, dict):
             continue
         for dev in data.get("devices") or []:
-            slot = dev.get("slot")
+            device = dev.get("device")
+            slot = slots.get(ipg_io.dev_key(type_, device)) if device not in (None, "") else None
+            if slot is None:
+                slot = dev.get("slot")
             if slot is None:
                 continue
-            slot = int(slot)
+            try:
+                slot = int(slot)
+            except (TypeError, ValueError):
+                continue
+            if not (1 <= slot <= ipg_io.SLOT_MAX):
+                continue
             if dev.get("label"):
-                dev_labels.setdefault((type_, slot), str(dev["label"]))
+                dev_labels.setdefault(slot, str(dev["label"]))
             for b in dev.get("bindings") or []:
-                ch = (type_, slot, int(b.get("lane") or 1))
-                channels.setdefault(ch, {})[b.get("key")] = b
+                try:
+                    lane = int(b.get("lane") or 1)
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= lane <= ipg_io.LANE_MAX:
+                    ch = channels.setdefault((slot, lane), {"type": type_, "binds": {}})
+                    ch["binds"][b.get("key")] = b
 
-    # 2. Affectation collante voie ↔ canal (persistée, jamais décalée).
-    reg = _assign_lanes(set(channels))
-
-    # 3. Grille pleine : les N voies émettent toujours tout le catalogue.
+    # 2. Grille pleine, ADRESSÉE PAR SLOT : toutes les voies émettent tout le catalogue.
     seen = set()
     _ensure_node(elements, seen, [IPG_ROOT_ID], prof.get("label") or "IPG")
-    for voie in range(1, nlanes + 1):
-        ch = reg.get(voie)
-        binds = channels.get(ch, {}) if ch else {}
-        _ensure_node(elements, seen, [IPG_ROOT_ID, voie], "Voie %d" % voie)
+    nassigned = 0
+    for slot in range(1, nslots + 1):
+        for lane in range(1, nlanes + 1):
+            voie = ipg_io.lane_signal(slot, lane)       # 100×slot + n° local
+            ch = channels.get((slot, lane))
+            binds = ch["binds"] if ch else {}
+            if ch:
+                nassigned += 1
+            _ensure_node(elements, seen, [IPG_ROOT_ID, voie], "S%d voie %d" % (slot, lane))
 
-        # Bloc identité (hors profil) : à qui la voie est affectée, en lecture seule.
-        _ensure_node(elements, seen, [IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID], "Voie")
-        dev = (dev_labels.get((ch[0], ch[1])) or ch[0]) if ch else ""
-        native = ("slot %d · voie %d" % (ch[1], ch[2])) if ch else ""
-        elements.append(([IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID, 1], "param", "Affectée", "",
-                         ch is not None, glow.PT_BOOLEAN, False))
-        elements.append(([IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID, 2], "param", "Équipement", "",
-                         dev, glow.PT_STRING, False))
-        elements.append(([IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID, 3], "param", "Canal natif", "",
-                         native, glow.PT_STRING, False))
+            # Bloc identité (hors profil) : à qui la voie est affectée, en lecture seule.
+            # L'occupation vient du SLOT, pas des bindings : une passerelle pure (CDE, Newt)
+            # tient un slot et des voies dans les grilles sans mapper une seule clé du
+            # catalogue. La dire « non affectée » aurait été un mensonge au pupitre.
+            _ensure_node(elements, seen, [IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID], "Voie")
+            io_dev = io_devices.get(slot)
+            occupied = ch is not None or io_dev is not None
+            label = ((io_dev or {}).get("label") or dev_labels.get(slot)
+                     or (ch["type"] if ch else "")) if occupied else ""
+            elements.append(([IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID, 1], "param", "Affectée", "",
+                             occupied, glow.PT_BOOLEAN, False))
+            elements.append(([IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID, 2], "param", "Équipement", "",
+                             label, glow.PT_STRING, False))
+            elements.append(([IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID, 3], "param", "Canal natif", "",
+                             "slot %d · voie %d" % (slot, lane) if occupied else "",
+                             glow.PT_STRING, False))
 
-        # Catalogue complet du profil, dans l'ordre. Une voie affectée remplit ce que le device
-        # expose (valeur + ref → pilotable) ; le reste, et toute voie libre, tombe au défaut.
-        for block in prof.get("blocks") or []:
-            bkey, bid, blabel = block.get("key"), block.get("id"), block.get("label")
-            if not bkey or bid is None:
-                continue
-            _ensure_node(elements, seen, [IPG_ROOT_ID, voie, bid], blabel or bkey)
-            for p in block.get("params") or []:
-                pkey, pid = p.get("key"), p.get("id")
-                if not pkey or pid is None:
+            # Catalogue complet du profil, dans l'ordre. Une voie affectée remplit ce que le
+            # device expose (valeur + ref → pilotable) ; le reste, et toute voie libre, tombe
+            # au défaut.
+            for block in prof.get("blocks") or []:
+                bkey, bid, blabel = block.get("key"), block.get("id"), block.get("label")
+                if not bkey or bid is None:
                     continue
-                res = index.get("%s.%s" % (bkey, pkey))
-                if not res:
-                    continue
-                b = binds.get("%s.%s" % (bkey, pkey))
-                if b is not None:
-                    value = b.get("value")
-                    minimum = b.get("min") if b.get("min") is not None else res.get("min")
-                    maximum = b.get("max") if b.get("max") is not None else res.get("max")
-                    ref = (ch[0], b.get("ref")) if b.get("ref") is not None else None
-                else:
-                    value = _CANON_DEFAULTS.get(res["type"], "")
-                    minimum, maximum = res.get("min"), res.get("max")
-                    ref = None
-                _emit_canon_param(elements, path_map,
-                                  [IPG_ROOT_ID, voie, bid, pid], res, value, ref, minimum, maximum)
+                _ensure_node(elements, seen, [IPG_ROOT_ID, voie, bid], blabel or bkey)
+                for p in block.get("params") or []:
+                    pkey, pid = p.get("key"), p.get("id")
+                    if not pkey or pid is None:
+                        continue
+                    res = index.get("%s.%s" % (bkey, pkey))
+                    if not res:
+                        continue
+                    b = binds.get("%s.%s" % (bkey, pkey))
+                    if b is not None:
+                        value = b.get("value")
+                        minimum = b.get("min") if b.get("min") is not None else res.get("min")
+                        maximum = b.get("max") if b.get("max") is not None else res.get("max")
+                        ref = (ch["type"], b.get("ref")) if b.get("ref") is not None else None
+                    else:
+                        value = _CANON_DEFAULTS.get(res["type"], "")
+                        minimum, maximum = res.get("min"), res.get("max")
+                        ref = None
+                    _emit_canon_param(elements, path_map, [IPG_ROOT_ID, voie, bid, pid],
+                                      res, value, ref, minimum, maximum)
 
-    contributors.append({"type": "ipg", "label": "%s (%d voies, %d affectée%s)" % (
-        prof.get("label") or "IPG", nlanes, len(reg), "s" if len(reg) != 1 else "")})
+    contributors.append({"type": "ipg", "label": "%s (%d slots × %d voies, %d affectée%s)" % (
+        prof.get("label") or "IPG", nslots, nlanes, nassigned, "s" if nassigned != 1 else "")})
+
+_EMPTY_IO = {"devices": {}, "by_slot": {}, "slots": {}, "numbers": {}}
+
+def _io_state(force=False):
+    """État `ember/io` du parc, avec sa péremption propre (IO_TTL_S). Ne lève jamais : un
+    échec de collecte rend le dernier état connu plutôt que de vider les grilles — un
+    contributeur momentanément muet ne doit pas faire disparaître ses crosspoints du pupitre."""
+    with _tree_lock:
+        state = _tree_cache.get("io")
+        fresh = state is not None and (time.monotonic() - (_tree_cache.get("io_ts") or 0)) < IO_TTL_S
+    if fresh and not force:
+        return state
+    try:
+        state = ipg_io.collect()
+    except Exception as e:
+        log.warning("emberplus: collecte ember/io échouée : %s", e)
+        return state if state is not None else dict(_EMPTY_IO)
+    with _tree_lock:
+        _tree_cache["io"] = state
+        _tree_cache["io_ts"] = time.monotonic()
+    return state
+
 
 def _build_tree():
     """Agrège les sous-arbres : (body racine, path_map, matrix_map, contributors).
@@ -388,24 +398,51 @@ def _build_tree():
     for idx, type_ in enumerate(_ember_types(), start=1):
         status, data = tools.call(type_, "ember/tree", "GET", actor=EMBER_ACTOR,
                                   timeout=TREE_CALL_TIMEOUT_S)
-        if status != 200 or not isinstance(data, dict):
-            log.warning("emberplus: %s ember/tree → %s (ignoré)", type_, status)
-            continue
-        label = str(data.get("label") or type_)
-        base = [idx]
-        try:
-            sub = [(base, "node", label, "")]
-            for node in data.get("nodes") or []:
-                _walk_node(base, node, sub, path_map, matrix_map, type_)
-        except Exception as e:
-            log.warning("emberplus: conversion arbre %s échouée : %s", type_, e)
-            continue
+        sub = pm = mm = label = None
+        if status == 200 and isinstance(data, dict):
+            label = str(data.get("label") or type_)
+            base = [idx]
+            try:
+                sub, pm, mm = [(base, "node", label, "")], {}, {}
+                for node in data.get("nodes") or []:
+                    _walk_node(base, node, sub, pm, mm, type_)
+            except Exception as e:
+                log.warning("emberplus: conversion arbre %s échouée : %s", type_, e)
+                sub = None
+        else:
+            log.warning("emberplus: %s ember/tree → %s", type_, status)
+        if sub is not None:
+            _subtree_cache[(type_, idx)] = (sub, pm, mm, label)
+        else:
+            # Un contributeur muet, lent ou cassé ne doit PAS faire DISPARAÎTRE son sous-arbre
+            # du pupitre : un nœud qui s'évanouit est bien pire qu'un nœud en retard — VSM perd
+            # ses chemins, et l'opérateur croit le matériel absent. On rejoue donc le dernier
+            # état connu, en le signalant dans la liste des contributeurs.
+            cached = _subtree_cache.get((type_, idx))
+            if not cached:
+                continue
+            sub, pm, mm, label = cached
+            label = "%s (dernier état connu)" % label
+            log.warning("emberplus: %s indisponible — sous-arbre précédent rejoué", type_)
         elements += sub
+        path_map.update(pm)
+        matrix_map.update(mm)
         contributors.append({"type": type_, "label": label})
+    # État des entrées/sorties du parc : il sert au moule (résolution des slots), aux six
+    # grilles de flux, à l'arbre des SDP et à la grille d'affectation. Une seule collecte,
+    # avec sa propre péremption (cf. IO_TTL_S) — c'est de loin le contributeur le plus lourd.
+    io_state = _io_state()
     try:
-        _append_canonical(elements, path_map, contributors)
+        _append_canonical(elements, path_map, contributors, io_state)
     except Exception as e:
         log.warning("emberplus: agrégation canonique (IPG) échouée : %s", e)
+    try:
+        matrix_map.update(ipg_io.build_matrices(elements, io_state))
+        ipg_io.build_sdp(elements, path_map, io_state)
+        ndev = len(io_state.get("devices") or {})
+        contributors.append({"type": "flux", "label": "Grilles de flux (%d IPG)" % ndev})
+    except Exception as e:
+        log.warning("emberplus: grilles de flux échouées : %s", e)
     try:
         _append_service_node(elements, path_map)
     except Exception as e:
@@ -416,7 +453,7 @@ def _build_tree():
     # PAS d'encodage ici : la comparaison n'a besoin que de l'index. Le corps encodé ne sert
     # qu'à répondre à un GetDirectory ou à pousser un arbre complet, cas rares — l'encoder à
     # chaque cycle coûtait des centaines de ms pour rien sur un gros arbre (cf. _encoded_body).
-    return elements, path_map, matrix_map, contributors, el_index
+    return elements, path_map, matrix_map, contributors, el_index, io_state
 
 
 def _encoded_body():
@@ -441,11 +478,11 @@ def _reaggregate(force=False):
         fresh = (time.monotonic() - _tree_cache["ts"]) < TREE_TTL_S
         if not force and fresh and _tree_cache.get("elements_list") is not None:
             return _tree_cache["path_map"], _tree_cache["matrix_map"]
-    elements, path_map, matrix_map, contributors, el_index = _build_tree()
+    elements, path_map, matrix_map, contributors, el_index, io_state = _build_tree()
     with _tree_lock:
         _tree_cache.update({"ts": time.monotonic(), "body": None, "path_map": path_map,
                             "matrix_map": matrix_map, "contributors": contributors,
-                            "elements": el_index, "elements_list": elements})
+                            "elements": el_index, "elements_list": elements, "io": io_state})
     with _lock:
         _status["contributors"] = contributors
     return path_map, matrix_map
@@ -525,10 +562,14 @@ def _append_service_node(elements, path_map):
         port = int(_status.get("port") or 0)
         started = _status.get("started_at")
         err = _status.get("last_error")
-    # Voies du vivier : total (taille du vivier) et affectées (registre). Le total sert de
-    # repère au pupitre ; les affectées disent combien de canaux réels sont mappés.
-    nlanes = _num_lanes()
-    nassigned = sum(1 for v in _lane_registry() if 1 <= v <= nlanes)
+    # Voies émises : slots × voies par slot. Les « affectées » sont les slots réellement
+    # occupés par un IPG — depuis que la voie se calcule (§12.9.4), c'est le slot qui porte
+    # l'information, plus un registre de voies.
+    with _tree_lock:
+        io_state = _tree_cache.get("io") or {}
+    nslots, nper = ipg_io.num_slots(), ipg_io.lanes_per_slot()
+    nlanes = nslots * nper
+    nassigned = sum(1 for s in (io_state.get("by_slot") or {}) if 1 <= s <= nslots) * nper
     # Compté sur l'agrégation en cours, + 1 : la cadence ci-dessous est le seul paramètre
     # inscriptible du nœud de service. Sert à repérer d'un coup d'œil un `writable` mal posé.
     nwrit = sum(1 for el in elements if el[1] == "param" and len(el) > 6 and el[6]) + 1
@@ -596,12 +637,19 @@ def _apply_setvalue(path, value):
     if not entry:
         log.info("emberplus: setvalue %s ignoré (inconnu ou lecture seule)", path)
         return False
-    type_, ref = entry
-    status, data = tools.call(type_, "ember/set", "POST",
-                              {"ref": ref, "value": value}, actor=EMBER_ACTOR)
+    # Une entrée porte (type, ref) ; les paramètres de signal IP de l'arbre SDP y ajoutent un
+    # `field`, car un même `ref` opaque couvre plusieurs valeurs inscriptibles (§12.7). Le
+    # champ reste ABSENT du payload dans tous les autres cas : les plugins du mode libre et du
+    # moule ne le voient jamais.
+    type_, ref = entry[0], entry[1]
+    field = entry[2] if len(entry) > 2 else None
+    payload = {"ref": ref, "value": value}
+    if field:
+        payload["field"] = field
+    status, data = tools.call(type_, "ember/set", "POST", payload, actor=EMBER_ACTOR)
     ok = status == 200 and isinstance(data, dict) and not data.get("error")
     if ok:
-        detail = json.dumps({"ref": ref, "value": value}, ensure_ascii=False)[:400]
+        detail = json.dumps(payload, ensure_ascii=False)[:400]
         audit_log(type_, "ember/set", detail, user_id=None, username=EMBER_ACTOR)
         log.info("emberplus: set %s %s = %r", type_, ref, value)
         refresh()
@@ -633,6 +681,62 @@ def _reload_matrix(type_, mpath):
         return None
     return local_mm.get(tuple(mpath))
 
+def _apply_canon_connect(matrix_path, m, target, sources, op):
+    """Crosspoint sur une grille CANONIQUE (1002/1003/1005). À la différence du mode libre, la
+    matrice appartient au service : c'est lui qui traduit les numéros globaux en termes locaux
+    au plugin (§12.4), et qui refuse tout ce que le plan interdit — une source d'un autre slot,
+    une voie hors bornes — sans même déranger le matériel."""
+    with _tree_lock:
+        io_state = _tree_cache.get("io")
+    if not io_state:
+        _reaggregate(force=True)
+        with _tree_lock:
+            io_state = _tree_cache.get("io") or {}
+    ok, touched = ipg_io.apply_connect(m["canon"], target, sources, op, io_state)
+    if not ok:
+        # Refus : l'état n'a pas bougé côté matériel, mais VSM affiche déjà son crosspoint
+        # optimiste. On rediffuse la matrice telle qu'elle est pour que le tally claque en
+        # arrière (§12.3) — sans ça, le pupitre mentirait jusqu'au prochain tick.
+        _broadcast_matrix(matrix_path, m)
+        return False
+    audit_log(touched or "emberplus", "ember/connect",
+              json.dumps({"grille": m["canon"], "target": target, "sources": sources, "op": op},
+                         ensure_ascii=False)[:400], user_id=None, username=EMBER_ACTOR)
+    log.info("emberplus: connect canonique %s tgt=%s src=%s op=%s", m["canon"], target, sources, op)
+    # Tally immédiat : on ne recharge que le contributeur touché (l'analogue de _reload_matrix),
+    # puis on rediffuse TOUTES les grilles de flux — une commutation d'entrée peut changer une
+    # sortie, et une essence peut en entraîner une autre. Une affectation de slot, elle,
+    # renumérote tout : arbre complet.
+    if m["canon"] == "slot":
+        refresh()
+        return True
+    state2 = ipg_io.reload_type(io_state, touched) if touched else None
+    if state2 is None:
+        refresh()
+        return True
+    _rebuild_canon_matrices(state2)
+    return True
+
+
+def _rebuild_canon_matrices(state):
+    """Reconstruit les grilles de flux depuis un état rechargé et les rediffuse tout de suite."""
+    try:
+        fresh = ipg_io.build_matrices([], state)     # [] : on jette les nœuds « Infos », déjà émis
+    except Exception as e:
+        log.warning("emberplus: reconstruction des grilles échouée : %s", e)
+        refresh()
+        return
+    with _tree_lock:
+        _tree_cache["io"] = state
+        _tree_cache["io_ts"] = time.monotonic()   # l'état vient d'être relu : sa péremption repart
+        for path, entry in fresh.items():
+            if path in _tree_cache["matrix_map"]:
+                _tree_cache["matrix_map"][path] = entry
+    for path, entry in fresh.items():
+        if entry.get("canon") != "slot":
+            _broadcast_matrix(list(path), entry)
+
+
 def _apply_connect(matrix_path, target, sources, operation):
     """Route un crosspoint (consumer→provider) vers l'outil propriétaire de la matrice."""
     _, matrix_map = _reaggregate()      # tables seules : pas besoin d'encoder l'arbre
@@ -641,6 +745,8 @@ def _apply_connect(matrix_path, target, sources, operation):
         log.info("emberplus: connect %s ignoré (matrice inconnue)", matrix_path)
         return False
     op = _OP_NAME.get(operation, "absolute")
+    if m.get("canon"):
+        return _apply_canon_connect(matrix_path, m, target, sources, op)
     status, data = tools.call(m["type"], "ember/connect", "POST",
                               {"ref": m["ref"], "target": target,
                                "sources": sources, "operation": op}, actor=EMBER_ACTOR)
@@ -974,7 +1080,8 @@ def register_routes(bp):
         out["enabled_setting"] = bool(settings.get("emberplus_enabled"))
         out["port_setting"] = int(settings.get("emberplus_port") or 9000)
         out["push_interval_setting"] = _push_interval()
-        out["lanes_count_setting"] = _num_lanes()
+        out["slots_count_setting"] = ipg_io.num_slots()
+        out["lanes_per_slot_setting"] = ipg_io.lanes_per_slot()
         return jsonify(out)
 
     @bp.route("/api/emberplus/apply", methods=["POST"])
@@ -995,17 +1102,27 @@ def register_routes(bp):
                 return jsonify({"error": "cadence hors bornes (%d–%d s)"
                                 % (PUSH_INTERVAL_MIN_S, PUSH_INTERVAL_MAX_S)}), 400
             settings.set("emberplus_push_interval", push)
-        lanes = data.get("lanes_count")
-        if lanes is not None:
+        # Bornes d'ÉMISSION (§12.9.4). Les AGRANDIR est sûr (on ajoute en fin) ; les réduire
+        # fait disparaître des chemins peut-être déjà câblés au pupitre — d'où l'avertissement
+        # côté UI, pas un refus : c'est une décision d'exploitation, pas une erreur.
+        structure = False
+        for key, field, lo, hi, label in (
+                ("emberplus_slots_count", "slots_count", 1, ipg_io.SLOT_MAX, "slots"),
+                ("emberplus_lanes_per_slot", "lanes_per_slot", 1, ipg_io.LANE_MAX, "voies par slot")):
+            v = data.get(field)
+            if v is None:
+                continue
             try:
-                lanes = int(lanes)
+                v = int(v)
             except (TypeError, ValueError):
-                return jsonify({"error": "nombre de voies invalide"}), 400
-            if not (LANES_COUNT_MIN <= lanes <= LANES_COUNT_MAX):
-                return jsonify({"error": "nombre de voies hors bornes (%d–%d)"
-                                % (LANES_COUNT_MIN, LANES_COUNT_MAX)}), 400
-            settings.set("emberplus_lanes_count", lanes)
-            refresh()          # la taille du vivier change la STRUCTURE → réémettre l'arbre
+                return jsonify({"error": "nombre de %s invalide" % label}), 400
+            if not (lo <= v <= hi):
+                return jsonify({"error": "nombre de %s hors bornes (%d–%d)"
+                                % (label, lo, hi)}), 400
+            settings.set(key, v)
+            structure = True
+        if structure:
+            refresh()          # la taille des grilles change la STRUCTURE → réémettre l'arbre
         settings.set("emberplus_enabled", enabled)
         settings.set("emberplus_port", port)
         if enabled:
