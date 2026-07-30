@@ -1,16 +1,15 @@
 {
-  "version": "0.14.0",
-  "published_at": "2026-07-29",
+  "version": "0.15.0",
+  "published_at": "2026-07-30",
   "changes": {
     "Nouveautés": [
-      "CATALOGUE ENRICHI depuis les relevés du Neuron réel : `output.wire_mode` (5.3) et `gateway.input_wire` (7.2), enum [« 1 lien (12G) », « 4 liens (3G) »] — en quad, une voie UHD occupe QUATRE connecteurs physiques ; et `status.input_valid` (9.4), chaîne en lecture seule, où le matériel publie son propre verdict en comparant le signal réel au mode déclaré. Ajouts EN FIN de bloc, aucun id renuméroté. Le mode UHD n'a délibérément PAS de paramètre : il est dérivé du format vidéo, et l'écrire directement est refusé par le matériel."
+      "RESTRICTION D'ÉCRITURE PAR ADRESSE (§11.5). Le protocole Ember+ ne prévoit aucune authentification, et le provider pilote désormais des centaines de paramètres inscriptibles et 400 crosspoints sur du matériel de production : n'importe qui sur le réseau pouvait écrire. Réglage `emberplus_write_allow` — seules les adresses déclarées peuvent faire un SetValue ou un crosspoint, la LECTURE reste ouverte pour ne pas gêner un consumer de diagnostic. Un crosspoint refusé rediffuse la matrice telle qu'elle est, sinon le pupitre garderait à l'écran un croisement qui n'a jamais eu lieu. Liste vide = aucune restriction (pour ne rien casser sur une installation existante) MAIS l'état est journalisé en avertissement au démarrage : une protection jamais configurée serait exactement le « livré mais pas en service » qui a déjà coûté cher ici.",
+      "SOUS-ARBRES PERSISTÉS SUR DISQUE (`emberplus_trees.json`, remplacement atomique). Le repli en mémoire ne protégeait qu'APRÈS un premier succès : redémarrer l'application pendant qu'un équipement était éteint faisait disparaître son sous-arbre du pupitre. Or c'est la STRUCTURE qui casse une configuration VSM, pas des valeurs périmées. On persiste la RÉPONSE BRUTE de `ember/tree`, pas les structures dérivées : plus petit, et le rechargement repasse par exactement le même code que si le plugin venait de répondre. Vérifié à froid : 6 sous-arbres rechargés, les six contributeurs présents."
     ],
-    "Corrections": [
-      "LE RÉGLAGE DE PROFIL MASQUAIT LE CATALOGUE DU CODE. `emberplus_profile` contenait un profil v1 (blocs 1-6) et `get_profile()` préférait toujours la surcharge : le catalogue passerelle des blocs 7-9, livré en 0.10.0 et réputé fait, n'avait JAMAIS tourné sur cette instance. C'est le piège de l'image Docker périmée transposé aux réglages — une surcharge posée une fois gèle le catalogue pour toujours, sans que rien ne le signale. Une surcharge de version inférieure à celle du code est désormais ignorée, avec un avertissement dit UNE SEULE FOIS (get_profile est appelé toutes les 5 s : journalisé sans garde, il noyait le journal et se rendait invisible à force d'être répété). L'ignorer est sûr par construction : la règle d'or du catalogue veut qu'on n'ajoute qu'en fin, donc une version plus récente est toujours un surensemble."
-    ],
+    "Corrections": [],
     "Bugs connus": [
-      "Le catalogue v2 réellement actif fait passer le GetDirectory complet de 1,16 à 2,18 Mo (26 818 éléments, 16 slots × 32 voies). Les deltas restent minuscules ; c'est le coût d'une première connexion. Si le parc grandit, ce sont les bornes d'émission (slots × voies) qu'il faudra rediscuter.",
-      "Aucune écriture n'a encore traversé la chaîne complète VSM → service → ember/connect → matériel."
+      "Aucune écriture n'a encore traversé la chaîne complète VSM → service → ember/connect → matériel.",
+      "La liste d'écriture est vide par défaut : tant qu'elle n'est pas renseignée, la restriction n'existe pas."
     ]
   }
 }

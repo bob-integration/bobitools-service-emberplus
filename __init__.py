@@ -24,11 +24,12 @@ Socle serveur (boucle TCP, S101, debounce) repris du provider Ember+ de Bobi.Stu
 """
 import json
 import logging
+import os
 import socket
 import threading
 import time
 
-from app import settings, tools
+from app import config, settings, tools
 from app import plugins as _plugins
 from app.database import audit_log
 from . import emberplus_glow as glow
@@ -117,11 +118,19 @@ _status = {
 # `elements` {tuple(path): élément} est l'index de la DERNIÈRE agrégation : il sert de point
 # de comparaison pour n'émettre que ce qui a bougé (cf. _broadcast_update).
 _tree_lock = threading.Lock()
-# Dernier sous-arbre CONNU par contributeur, {(type, index racine): (éléments, path_map,
-# matrix_map, label)}. Sert de repli quand `ember/tree` échoue ou déborde du délai : mesuré le
-# 2026-07-29, le `ember/tree` du SNP met 4 à 9 s pour 687 ko et sautait donc une fois sur deux,
-# faisant disparaître tout son sous-arbre du pupitre.
-_subtree_cache = {}
+# Dernier sous-arbre CONNU par contributeur. Sert de repli quand `ember/tree` échoue ou déborde
+# du délai : mesuré le 2026-07-29, le `ember/tree` du SNP met 4 à 9 s pour 687 ko et sautait donc
+# une fois sur deux, faisant disparaître tout son sous-arbre du pupitre.
+#
+# Un cache en MÉMOIRE : il ne protège donc qu'APRÈS un premier succès.
+# Redémarrer l'application pendant qu'un équipement est éteint faisait disparaître son
+# sous-arbre du pupitre — et c'est la STRUCTURE qui casse une configuration VSM, pas des
+# valeurs périmées. On persiste donc la RÉPONSE BRUTE de `ember/tree` par contributeur, et
+# pas les structures dérivées : c'est plus petit, et le rechargement repasse par exactement
+# le même code (`_walk_node`) que si le plugin venait de répondre.
+_TREES_FILE = os.path.join(os.path.dirname(config.DB_PATH), "emberplus_trees.json")
+_raw_trees = {}                # {type: réponse ember/tree}, miroir mémoire du fichier
+_raw_trees_dirty = False
 
 _tree_cache = {"ts": 0.0, "body": None, "path_map": {}, "matrix_map": {}, "contributors": [],
                "elements": {}, "elements_list": None, "io": None, "io_ts": 0.0}
@@ -130,6 +139,37 @@ _tree_cache = {"ts": 0.0, "body": None, "path_map": {}, "matrix_map": {}, "contr
 # ═════════════════════════════════════════════════════════════════════
 # Agrégation des contributions d'outils → éléments Glow plats
 # ═════════════════════════════════════════════════════════════════════
+
+def _load_raw_trees():
+    """Recharge les sous-arbres persistés. Silencieux si le fichier n'existe pas encore."""
+    global _raw_trees
+    try:
+        with open(_TREES_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            _raw_trees = {k: v for k, v in d.items() if isinstance(v, dict)}
+            log.info("emberplus: %d sous-arbre(s) rechargé(s) depuis le disque", len(_raw_trees))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("emberplus: relecture de %s échouée : %s", _TREES_FILE, e)
+
+
+def _save_raw_trees():
+    """Écrit les sous-arbres connus, par remplacement atomique — un fichier tronqué par une
+    coupure serait pire que pas de fichier du tout."""
+    global _raw_trees_dirty
+    if not _raw_trees_dirty:
+        return
+    tmp = _TREES_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_raw_trees, f, ensure_ascii=False)
+        os.replace(tmp, _TREES_FILE)
+        _raw_trees_dirty = False
+    except Exception as e:
+        log.warning("emberplus: écriture de %s échouée : %s", _TREES_FILE, e)
+
 
 def _ember_types():
     """Types des outils activés déclarant `ember: true`, triés (index racine stable)."""
@@ -395,35 +435,38 @@ def _build_tree():
     path_map = {}
     matrix_map = {}
     contributors = []
+    global _raw_trees_dirty
     for idx, type_ in enumerate(_ember_types(), start=1):
         status, data = tools.call(type_, "ember/tree", "GET", actor=EMBER_ACTOR,
                                   timeout=TREE_CALL_TIMEOUT_S)
-        sub = pm = mm = label = None
-        if status == 200 and isinstance(data, dict):
-            label = str(data.get("label") or type_)
-            base = [idx]
-            try:
-                sub, pm, mm = [(base, "node", label, "")], {}, {}
-                for node in data.get("nodes") or []:
-                    _walk_node(base, node, sub, pm, mm, type_)
-            except Exception as e:
-                log.warning("emberplus: conversion arbre %s échouée : %s", type_, e)
-                sub = None
-        else:
-            log.warning("emberplus: %s ember/tree → %s", type_, status)
-        if sub is not None:
-            _subtree_cache[(type_, idx)] = (sub, pm, mm, label)
-        else:
+        stale = False
+        if not (status == 200 and isinstance(data, dict)):
             # Un contributeur muet, lent ou cassé ne doit PAS faire DISPARAÎTRE son sous-arbre
             # du pupitre : un nœud qui s'évanouit est bien pire qu'un nœud en retard — VSM perd
             # ses chemins, et l'opérateur croit le matériel absent. On rejoue donc le dernier
-            # état connu, en le signalant dans la liste des contributeurs.
-            cached = _subtree_cache.get((type_, idx))
-            if not cached:
+            # état connu, y compris APRÈS UN REDÉMARRAGE grâce au fichier (le cache mémoire, lui,
+            # ne protège qu'après un premier succès dans le processus courant).
+            log.warning("emberplus: %s ember/tree → %s", type_, status)
+            data = _raw_trees.get(type_)
+            if not isinstance(data, dict):
                 continue
-            sub, pm, mm, label = cached
-            label = "%s (dernier état connu)" % label
+            stale = True
             log.warning("emberplus: %s indisponible — sous-arbre précédent rejoué", type_)
+        elif _raw_trees.get(type_) != data:
+            _raw_trees[type_] = data
+            _raw_trees_dirty = True
+        label = str(data.get("label") or type_)
+        base = [idx]
+        try:
+            sub, pm, mm = [(base, "node", label, "")], {}, {}
+            for node in data.get("nodes") or []:
+                _walk_node(base, node, sub, pm, mm, type_)
+        except Exception as e:
+            log.warning("emberplus: conversion arbre %s échouée : %s", type_, e)
+            continue
+        if stale:
+            label = "%s (dernier état connu)" % label
+            sub[0] = (base, "node", label, "")
         elements += sub
         path_map.update(pm)
         matrix_map.update(mm)
@@ -449,6 +492,7 @@ def _build_tree():
         log.warning("emberplus: nœud de service échoué : %s", e)
     # Index par chemin : base de la comparaison incrémentale. Un élément porte à la fois sa
     # valeur et son libellé, donc comparer les tuples suffit à détecter tout ce qui bouge.
+    _save_raw_trees()      # après agrégation : un sous-arbre neuf survivra au prochain arrêt
     el_index = {tuple(el[0]): el for el in elements}
     # PAS d'encodage ici : la comparaison n'a besoin que de l'index. Le corps encodé ne sert
     # qu'à répondre à un GetDirectory ou à pousser un arbre complet, cas rares — l'encoder à
@@ -628,6 +672,29 @@ def _apply_service_setvalue(path, value):
 # ═════════════════════════════════════════════════════════════════════
 # Application d'un SetValue → routage vers l'outil propriétaire
 # ═════════════════════════════════════════════════════════════════════
+
+def _write_allowed(addr):
+    """Vrai si cette adresse a le droit d'ÉCRIRE (SetValue et crosspoints).
+
+    Le provider est sans authentification — c'est le §11.5, et il pilote désormais des
+    centaines de paramètres inscriptibles sur du matériel de production. À défaut de pouvoir
+    authentifier (le protocole ne le prévoit pas), on restreint par adresse : seul le pupitre
+    déclaré écrit, tout le monde peut lire. Un consumer de diagnostic ne casse donc pas.
+
+    Liste VIDE = aucune restriction, pour ne rien casser sur une installation existante — mais
+    l'état est signalé au démarrage et dans le nœud de service, faute de quoi une protection
+    jamais configurée serait exactement le genre de « livré mais pas en service » qui a déjà
+    coûté cher à ce projet."""
+    allow = _write_allow_list()
+    if not allow:
+        return True
+    return (addr[0] if isinstance(addr, (tuple, list)) else str(addr)) in allow
+
+
+def _write_allow_list():
+    raw = settings.get("emberplus_write_allow") or ""
+    return {p.strip() for p in str(raw).replace(";", ",").split(",") if p.strip()}
+
 
 def _apply_setvalue(path, value):
     if _apply_service_setvalue(path, value):     # paramètres du service, avant tout routage
@@ -942,8 +1009,20 @@ def _process_message(sock, addr, kind, payload):
             with _lock:
                 _subscribed.discard(sock)
         elif a["kind"] == "setvalue":
+            if not _write_allowed(addr):
+                log.warning("emberplus: SetValue REFUSÉ depuis %s (hors liste d'écriture)", addr)
+                continue
             _apply_setvalue(a["path"], a["value"])
         elif a["kind"] == "connect":
+            if not _write_allowed(addr):
+                log.warning("emberplus: crosspoint REFUSÉ depuis %s (hors liste d'écriture)", addr)
+                # On rediffuse la matrice telle qu'elle est : sans ça le pupitre garderait
+                # à l'écran un crosspoint qui n'a jamais eu lieu (même principe qu'au §12.3).
+                _, matrix_map = _reaggregate()
+                m = matrix_map.get(tuple(a["matrix_path"]))
+                if m:
+                    _send_frame(sock, _matrix_body(list(a["matrix_path"]), m))
+                continue
             _apply_connect(a["matrix_path"], a["target"], a["sources"], a["operation"])
 
 def _server_loop(port):
@@ -1054,6 +1133,11 @@ def is_running():
 def boot():
     """Démarrage au lancement de l'app : démarre le serveur si activé en réglages.
     Appelé par le boot générique des services (main.py) après init_db()."""
+    _load_raw_trees()      # AVANT tout : un équipement éteint au démarrage garde ses chemins
+    if settings.get("emberplus_enabled") and not _write_allow_list():
+        log.warning("emberplus: AUCUNE restriction d'écriture — n'importe quelle adresse du "
+                    "réseau peut écrire sur le matériel. Renseigner `emberplus_write_allow` "
+                    "(Réglages → Ember+) avec l'adresse du pupitre.")
     try:
         if settings.get("emberplus_enabled"):
             port = int(settings.get("emberplus_port") or 9000)
