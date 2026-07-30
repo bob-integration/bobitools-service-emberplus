@@ -261,7 +261,17 @@ def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maxim
     """Émet un paramètre canonique (forme positionnelle enum/bornes de `_encode_element`) et,
     s'il est inscriptible ET porte un `ref`, l'inscrit dans `path_map` (routage du SetValue)."""
     ptype = _TYPE_MAP.get(res["type"], glow.PT_STRING)
-    writable = bool(res.get("writable", True))
+    # Un paramètre que le device courant NE MAPPE PAS (aucun `ref`) est annoncé en LECTURE
+    # SEULE, même si le catalogue le dit inscriptible. Sans ça, la grille pleine produisait
+    # 416 « faux boutons » par slot : VSM acceptait l'édition, le service la jetait faute de
+    # route, et la valeur revenait à la poussée suivante — sans le moindre message. C'est le
+    # miroir du faux verrou, et il érode autant la confiance dans la surface de contrôle.
+    #
+    # Le drapeau varie donc d'un device à l'autre, et l'arbre n'est plus byte-identique entre
+    # deux machines de couverture différente. C'est assumé : VSM s'accroche au CHEMIN
+    # (RELATIVE-OID, §2), pas au drapeau — les chemins câblés au pupitre survivent au
+    # remplacement, ce qui est la promesse réelle du moule.
+    writable = bool(res.get("writable", True)) and ref is not None
     if res["type"] == "enum":
         try:
             value = int(value or 0)

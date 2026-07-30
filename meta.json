@@ -1,15 +1,13 @@
 {
-  "version": "0.15.0",
+  "version": "0.16.0",
   "published_at": "2026-07-30",
   "changes": {
-    "Nouveautés": [
-      "RESTRICTION D'ÉCRITURE PAR ADRESSE (§11.5). Le protocole Ember+ ne prévoit aucune authentification, et le provider pilote désormais des centaines de paramètres inscriptibles et 400 crosspoints sur du matériel de production : n'importe qui sur le réseau pouvait écrire. Réglage `emberplus_write_allow` — seules les adresses déclarées peuvent faire un SetValue ou un crosspoint, la LECTURE reste ouverte pour ne pas gêner un consumer de diagnostic. Un crosspoint refusé rediffuse la matrice telle qu'elle est, sinon le pupitre garderait à l'écran un croisement qui n'a jamais eu lieu. Liste vide = aucune restriction (pour ne rien casser sur une installation existante) MAIS l'état est journalisé en avertissement au démarrage : une protection jamais configurée serait exactement le « livré mais pas en service » qui a déjà coûté cher ici.",
-      "SOUS-ARBRES PERSISTÉS SUR DISQUE (`emberplus_trees.json`, remplacement atomique). Le repli en mémoire ne protégeait qu'APRÈS un premier succès : redémarrer l'application pendant qu'un équipement était éteint faisait disparaître son sous-arbre du pupitre. Or c'est la STRUCTURE qui casse une configuration VSM, pas des valeurs périmées. On persiste la RÉPONSE BRUTE de `ember/tree`, pas les structures dérivées : plus petit, et le rechargement repasse par exactement le même code que si le plugin venait de répondre. Vérifié à froid : 6 sous-arbres rechargés, les six contributeurs présents."
+    "Corrections": [
+      "PLUS DE « FAUX BOUTONS » : un paramètre canonique que le device courant ne mappe pas (aucun `ref`) est désormais annoncé en LECTURE SEULE. Trouvé en franchissant le barreau 4 : même forme d'arbre mais 160 paramètres routables avec le SNP contre 288 avec le Neuron — les 416 autres étaient annoncés inscriptibles à VSM sans route vers aucun device. L'opérateur éditait, le service jetait la valeur faute de `ref`, elle revenait à la poussée suivante, SANS le moindre message. C'est le miroir du faux verrou, et il érode autant la confiance dans une surface de contrôle. Conséquence assumée : le drapeau varie d'un device à l'autre, donc l'arbre n'est plus byte-identique à couverture différente — VSM s'accroche au CHEMIN, pas au drapeau. Vérifié : 0 faux bouton sur les deux slots."
     ],
-    "Corrections": [],
+    "Nouveautés": [],
     "Bugs connus": [
-      "Aucune écriture n'a encore traversé la chaîne complète VSM → service → ember/connect → matériel.",
-      "La liste d'écriture est vide par défaut : tant qu'elle n'est pas renseignée, la restriction n'existe pas."
+      "Le barreau 4 (arbre identique entre deux devices sur un même slot) est franchi, mais il est vrai PAR CONSTRUCTION depuis la grille pleine : il valide que les chemins survivent au remplacement, pas que les machines soient équivalentes."
     ]
   }
 }
