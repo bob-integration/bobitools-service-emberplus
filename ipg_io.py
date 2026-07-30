@@ -31,7 +31,6 @@ l'audio 2 du slot 1 et la vidéo du slot 11.
 Contrat plugin : `GET ember/io` (§12.4, étendu aux essences en §12.10). Un outil qui ne répond
 pas 200 est ignoré en silence.
 """
-import json
 import logging
 
 from app import settings, tools
@@ -142,60 +141,20 @@ def io_types():
 
 
 def dev_key(type_, device):
-    """Clé d'un matériel : le type d'outil + son identifiant STABLE côté plugin. C'est la clé
-    des deux registres ci-dessous, donc de tout le plan de numérotation."""
+    """Clé d'un matériel : le type d'OUTIL CONTRIBUTEUR + l'identifiant qu'il publie. Depuis le
+    §12.11 le contributeur est la couche IPG, qui publie déjà une identité globale — la clé vaut
+    donc `ipg_generique:<famille>:<id matériel>`. Elle reste ce qu'elle a toujours été : stable,
+    opaque, et seule à désigner un matériel dans tout le plan de numérotation."""
     return "%s:%s" % (type_, device)
 
 
-def _load_map(key):
-    raw = settings.get(key)
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw or "{}")
-        except ValueError:
-            raw = {}
-    return raw if isinstance(raw, dict) else {}
-
-
-def slot_registry():
-    """Affectation device → slot. **Le service est autoritaire** (§12.8) : le `slot` que
-    remonte un plugin n'est plus qu'un défaut, consulté pour un matériel jamais affecté."""
-    out = {}
-    for k, v in _load_map("emberplus_slots").items():
-        try:
-            s = int(v)
-        except (TypeError, ValueError):
-            continue
-        if 1 <= s <= SLOT_MAX:
-            out[str(k)] = s
-    return out
-
-def save_slot_registry(reg):
-    settings.set("emberplus_slots", {k: int(v) for k, v in reg.items()})
-
-
-def device_registry():
-    """Numérotation COLLANTE des devices pour la grille d'affectation : un numéro attribué ne bouge
-    plus, et n'est pas réattribué après suppression du matériel."""
-    out = {}
-    for k, v in _load_map("emberplus_devices").items():
-        try:
-            out[str(k)] = int(v)
-        except (TypeError, ValueError):
-            continue
-    return out
-
-def save_device_registry(reg):
-    settings.set("emberplus_devices", {k: int(v) for k, v in reg.items()})
-
-
-def _device_number(reg, key):
-    """Numéro collant d'un device ; l'attribue s'il est neuf. Renvoie (n, modifié)."""
-    if key in reg:
-        return reg[key], False
-    n = max(reg.values()) + 1 if reg else 1
-    reg[key] = n
-    return n, True
+# NOTE (§12.11) — Il n'y a PLUS de registre d'affectation ici. Le slot et le numéro collant d'un
+# matériel appartiennent à la couche IPG (l'outil « IPG Générique »), qui les tient dans son
+# propre store et les publie dans `ember/io`. Ce service ne fait que les lire.
+#
+# Ce n'est pas un déplacement cosmétique : le slot commande le plan de numérotation, donc il
+# relève de la logique IPG, pas du protocole. Le laisser ici obligeait chaque futur protocole à
+# venir chercher son affectation dans les réglages d'Ember+ — ou à s'en inventer une autre.
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -331,23 +290,29 @@ def _norm_lanes(raw):
 def _norm_device(type_, dev):
     """(clé, entrée) d'un device remonté par un plugin, ou (None, None) s'il est inexploitable.
     L'identifiant `device` est OBLIGATOIRE : sans lui le service ne peut ni le numéroter, ni
-    savoir qui il déplace d'un slot à l'autre."""
+    savoir qui il déplace d'un slot à l'autre.
+
+    Un `slot` que remonterait encore un plugin est IGNORÉ : depuis le §12.11 l'affectation
+    n'appartient qu'au registre, et un vœu du matériel serait un second verrou d'exposition —
+    exactement ce qu'on vient de supprimer."""
     if not isinstance(dev, dict):
         return None, None
     device = dev.get("device")
     if device in (None, ""):
         log.info("emberplus/io: %s remonte un device sans identifiant `device` — ignoré", type_)
         return None, None
-    slot = dev.get("slot")
-    try:
-        slot = int(slot) if slot is not None else None
-    except (TypeError, ValueError):
-        slot = None
-    if slot is not None and not (1 <= slot <= SLOT_MAX):
-        slot = None
+    def _int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
     return dev_key(type_, device), {
         "type": type_, "device": str(device), "label": str(dev.get("label") or device),
-        "want_slot": slot, "ref": dev.get("ref"),
+        "ref": dev.get("ref"), "slot": _int(dev.get("slot")),
+        "number": _int(dev.get("number")),
+        # Nom court saisi dans la couche IPG : les protocoles de pupitre plafonnent les
+        # libellés (4, 8 ou 12 caractères en SW-P-08), donc le nom long ne passe pas.
+        "short": str(dev.get("short") or "") or None,
         "inputs": _norm_signals(dev.get("inputs"), "%s entrée" % type_),
         "outputs": _norm_signals(dev.get("outputs"), "%s sortie" % type_),
         "lanes": _norm_lanes(dev.get("lanes")),
@@ -355,56 +320,39 @@ def _norm_device(type_, dev):
 
 
 def _resolve_slots(devices):
-    """Pose chaque device sur son slot. Le REGISTRE prime ; le `slot` souhaité par le plugin
-    ne sert qu'à un matériel jamais affecté, et seulement si la place est libre."""
-    reg = slot_registry()
-    dreg = device_registry()
-    changed = dirty = False
-    taken = {}
-    # 1. Ce que le registre dit déjà, dans un ordre déterministe.
+    """Indexe par slot ce que la couche IPG a DÉCIDÉ (§12.11).
+
+    Le slot et le numéro collant arrivent tout faits dans `ember/io` : ce service ne les
+    choisit pas, il les lit. Un device sans slot n'est pas exposé — c'est la couche IPG qui
+    porte le sens de « exposé », en n'attribuant un slot que sur geste d'un opérateur.
+
+    **Rien ne s'affecte tout seul.** Tant qu'un matériel se posait sur le premier slot libre,
+    brancher un convertisseur suffisait à le publier, et le numéro qu'il recevait ne voulait
+    rien dire — alors qu'il commande tout le plan de numérotation (§12.2)."""
+    by_slot, slots, numbers = {}, {}, {}
     for key in sorted(devices):
-        s = reg.get(key)
-        if s is not None and s not in taken:
-            taken[s] = key
-    # 2. Les nouveaux venus : vœu du plugin s'il est libre, sinon premier slot libre.
-    for key in sorted(devices):
-        if key in reg and reg[key] in taken and taken[reg[key]] == key:
-            continue
-        want = devices[key].get("want_slot")
-        s = want if (want and want not in taken) else None
-        if s is None:
-            for cand in range(1, SLOT_MAX + 1):
-                if cand not in taken:
-                    s = cand
-                    break
-        if s is None:
-            log.warning("emberplus/io: plus un seul slot libre, %s non affecté", key)
-            continue
-        reg[key] = s
-        taken[s] = key
-        changed = True
-    # 3. Numérotation collante pour la grille d'affectation.
-    for key in sorted(devices):
-        _, added = _device_number(dreg, key)
-        dirty = dirty or added
-    if changed:
-        try:
-            save_slot_registry(reg)
-        except Exception as e:
-            log.warning("emberplus/io: sauvegarde des slots échouée : %s", e)
-    if dirty:
-        try:
-            save_device_registry(dreg)
-        except Exception as e:
-            log.warning("emberplus/io: sauvegarde des numéros de device échouée : %s", e)
-    by_slot = {}
-    for key, entry in devices.items():
-        s = reg.get(key)
+        entry = devices[key]
+        n = entry.get("number")
+        if n is not None:
+            numbers[key] = n
+        s = entry.get("slot")
         if s is None:
             continue
-        entry["slot"] = s
+        if not (1 <= s <= SLOT_MAX):
+            log.info("emberplus/io: %s annoncé sur le slot %s, hors plan (1..%d) — ignoré",
+                     key, s, SLOT_MAX)
+            entry["slot"] = None
+            continue
+        if s in by_slot:
+            # La couche IPG l'interdit ; deux contributeurs IPG concurrents, eux, pourraient
+            # le produire. Premier arrivé dans l'ordre des clés, et on le dit.
+            log.warning("emberplus/io: slot %d revendiqué par %s et %s — %s ignoré",
+                        s, by_slot[s], key, key)
+            entry["slot"] = None
+            continue
+        slots[key] = s
         by_slot[s] = key
-    return {"devices": devices, "by_slot": by_slot, "slots": reg, "numbers": dreg}
+    return {"devices": devices, "by_slot": by_slot, "slots": slots, "numbers": numbers}
 
 
 def collect():
@@ -841,32 +789,51 @@ def _local_source(spec, slot, src):
     return out
 
 
+def _ipg_contributor(state):
+    """Le type d'outil qui porte la couche IPG. On ne le code pas en dur : le service n'a pas à
+    connaître le nom de l'outil qui l'alimente, seulement à savoir à qui renvoyer une
+    affectation.
+
+    ⚠ Il se lit dans le REGISTRE DES OUTILS, pas dans les devices collectés. La couche IPG ne
+    publie que les matériels POSÉS sur un slot : les déduire d'eux ferait qu'un parc entièrement
+    dépeuplé n'aurait plus de contributeur connu, donc plus aucun moyen de réaffecter quoi que
+    ce soit. Vider le dernier slot serait irréversible depuis le pupitre."""
+    t = next(iter(io_types()), None)
+    if t:
+        return t
+    for entry in (state.get("devices") or {}).values():
+        if entry.get("type"):
+            return entry["type"]
+    return None
+
+
 def _apply_slot(slot, src, state):
-    """Affecte (ou libère) un slot. Purement interne au service : aucun plugin n'est appelé,
-    c'est le registre qui fait foi (§12.8)."""
+    """Affecte (ou libère) un slot depuis la GRILLE 1010 (le geste au pupitre).
+
+    Le service ne décide plus rien ici : il TRANSMET à la couche IPG, seule propriétaire du
+    registre (§12.11). C'est ce qui garantit que l'écran de l'outil et le pupitre appliquent
+    exactement les mêmes règles — déplacement plutôt que duplication, un seul matériel par
+    slot — au lieu de deux implémentations qui divergeraient au premier oubli."""
     if not (1 <= slot <= num_slots()):
         log.info("emberplus/io: slot %s hors bornes", slot)
         return False
-    reg = slot_registry()
-    numbers = state.get("numbers") or {}
-    if src == PSEUDO_NONE:
-        freed = [k for k, s in reg.items() if s == slot]
-        for k in freed:
-            del reg[k]
-        if not freed:
-            return False
-        save_slot_registry(reg)
-        log.info("emberplus/io: slot %d libéré (%s)", slot, ", ".join(freed))
-        return True
-    wanted = src - DEV_SRC_OFFSET
-    key = next((k for k, n in numbers.items() if n == wanted), None)
-    if key is None:
-        log.info("emberplus/io: source %s inconnue dans la grille d'affectation", src)
+    type_ = _ipg_contributor(state)
+    if not type_:
+        log.info("emberplus/io: aucune couche IPG joignable, affectation impossible")
         return False
-    for k, s in list(reg.items()):
-        if s == slot and k != key:
-            del reg[k]                      # un slot porte UN device à la fois
-    reg[key] = slot                         # et un device déménage plutôt que de se dupliquer
-    save_slot_registry(reg)
-    log.info("emberplus/io: %s posé sur le slot %d", key, slot)
+    payload = {"slot": slot,
+               "number": None if src == PSEUDO_NONE else src - DEV_SRC_OFFSET}
+    try:
+        status, data = tools.call(type_, "ipg/assign", "POST", payload,
+                                  actor=EMBER_ACTOR, timeout=WRITE_TIMEOUT_S)
+    except Exception as e:
+        log.warning("emberplus/io: affectation renvoyée à %s a levé : %s", type_, e)
+        return False
+    if status != 200 or not isinstance(data, dict) or data.get("error"):
+        log.info("emberplus/io: affectation refusée par %s → %s %s", type_, status, data)
+        return False
+    if not data.get("changed"):
+        return False        # rien n'a bougé : inutile de renuméroter tout l'arbre
+    log.info("emberplus/io: slot %d — %s", slot,
+             "libéré" if payload["number"] is None else "matériel n° %d posé" % payload["number"])
     return True

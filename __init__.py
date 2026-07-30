@@ -302,8 +302,9 @@ def _append_canonical(elements, path_map, contributors, io_state):
     slot (§12.9.4), donc un device qui en remplace un autre sur le même slot hérite
     exactement de ses voies — ce que le slot promettait sans le tenir jusqu'ici.
 
-    Contrat plugin (GET ember/bindings) :
-        { "devices": [ { "device": str, "slot"?: int, "label"?: str,
+    Contrat plugin (GET ember/bindings) — plus de `slot` : le matériel décrit ce qu'il A,
+    jamais où il est posé (§12.11) :
+        { "devices": [ { "device": str, "label"?: str,
                          "bindings": [ { "key": "<bloc>.<param>", "lane"?: int,
                                          "value": <v>, "ref": <opaque>,
                                          "min"?: number, "max"?: number }, ... ] } ] }
@@ -318,9 +319,10 @@ def _append_canonical(elements, path_map, contributors, io_state):
     io_devices = {s: (io_state.get("devices") or {}).get(k)
                   for s, k in ((io_state or {}).get("by_slot") or {}).items()}
 
-    # 1. Collecte des bindings, indexés par (slot, voie locale) — le slot vient du REGISTRE
-    #    (le service est autoritaire, §12.8) ; celui que déclare le plugin n'est qu'un repli,
-    #    utile tant qu'un contributeur n'expose pas encore `ember/io`.
+    # 1. Collecte des bindings, indexés par (slot, voie locale). Le slot vient du REGISTRE et
+    #    de LUI SEUL (§12.11) : un device que le registre ignore n'entre pas dans le moule,
+    #    quoi qu'il déclare. Il n'y a plus de repli sur un vœu du plugin — c'était le second
+    #    verrou d'exposition, celui qui rendait le slot affiché imprévisible.
     channels = {}        # (slot, lane) -> { canon_key: binding }
     dev_labels = {}      # slot -> label lisible du device
     for type_ in _bindings_types():
@@ -330,16 +332,10 @@ def _append_canonical(elements, path_map, contributors, io_state):
             continue
         for dev in data.get("devices") or []:
             device = dev.get("device")
-            slot = slots.get(ipg_io.dev_key(type_, device)) if device not in (None, "") else None
-            if slot is None:
-                slot = dev.get("slot")
-            if slot is None:
+            if device in (None, ""):
                 continue
-            try:
-                slot = int(slot)
-            except (TypeError, ValueError):
-                continue
-            if not (1 <= slot <= ipg_io.SLOT_MAX):
+            slot = slots.get(ipg_io.dev_key(type_, device))
+            if slot is None or not (1 <= slot <= ipg_io.SLOT_MAX):
                 continue
             if dev.get("label"):
                 dev_labels.setdefault(slot, str(dev["label"]))
