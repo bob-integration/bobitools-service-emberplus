@@ -283,7 +283,12 @@ def _norm_lanes(raw):
         din = l.get("in") if isinstance(l.get("in"), dict) else {}
         dout = l.get("out") if isinstance(l.get("out"), dict) else {}
         out[lane] = {"in": _norm_essences(din, _in_block),
-                     "out": _norm_essences(dout, _out_block)}
+                     "out": _norm_essences(dout, _out_block),
+                     # Désignation CONSTRUCTEUR de la voie, facultative : « A1 » sur un SNP
+                     # (processeur + position), « A1 »…« H4 » sur un Neuron (path). Elle vient
+                     # du matériel, qui est seul à la connaître — un service qui la
+                     # recalculerait devrait connaître chaque famille.
+                     "name": str(l.get("name") or "") or None}
     return out
 
 

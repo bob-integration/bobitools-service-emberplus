@@ -374,8 +374,16 @@ def _append_canonical(elements, path_map, contributors, io_state):
                              occupied, glow.PT_BOOLEAN, False))
             elements.append(([IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID, 2], "param", "Équipement", "",
                              label, glow.PT_STRING, False))
+            # « Canal natif » : la désignation que le CONSTRUCTEUR donne à cette voie — « A1 »
+            # sur un SNP (processeur + position) ou un Neuron (path). C'est elle que
+            # l'exploitant lit sur la face avant, donc c'est elle qui doit apparaître ici ;
+            # le couple slot/voie ne fait que la situer dans notre plan. Les familles qui ne
+            # nomment pas leurs voies (CDE, Newt) retombent sur ce couple.
+            natif = ((io_dev or {}).get("lanes") or {}).get(lane, {}).get("name") \
+                if io_dev else None
             elements.append(([IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID, 3], "param", "Canal natif", "",
-                             "slot %d · voie %d" % (slot, lane) if occupied else "",
+                             ("%s · slot %d voie %d" % (natif, slot, lane) if natif
+                              else "slot %d · voie %d" % (slot, lane)) if occupied else "",
                              glow.PT_STRING, False))
 
             # Catalogue complet du profil, dans l'ordre. Une voie affectée remplit ce que le
