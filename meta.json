@@ -1,12 +1,15 @@
 {
-  "version": "0.16.0",
-  "published_at": "2026-07-30",
+  "version": "0.19.0",
+  "published_at": "2026-07-31",
   "changes": {
-    "Corrections": [
-      "PLUS DE « FAUX BOUTONS » : un paramètre canonique que le device courant ne mappe pas (aucun `ref`) est désormais annoncé en LECTURE SEULE. Trouvé en franchissant le barreau 4 : même forme d'arbre mais 160 paramètres routables avec le SNP contre 288 avec le Neuron — les 416 autres étaient annoncés inscriptibles à VSM sans route vers aucun device. L'opérateur éditait, le service jetait la valeur faute de `ref`, elle revenait à la poussée suivante, SANS le moindre message. C'est le miroir du faux verrou, et il érode autant la confiance dans une surface de contrôle. Conséquence assumée : le drapeau varie d'un device à l'autre, donc l'arbre n'est plus byte-identique à couverture différente — VSM s'accroche au CHEMIN, pas au drapeau. Vérifié : 0 faux bouton sur les deux slots."
+    "Nouveautés": [
+      "LE CATALOGUE CANONIQUE QUITTE LE SERVICE (§12.12), comme le registre d'affectation l'avait fait en 0.17.0 et pour la même raison : c'est de la logique IPG, pas de la logique de protocole. `profile.py` ne détient plus le catalogue, il le LIT chez la couche IPG (`GET ipg/profile`, cache 30 s) et n'en garde AUCUNE copie de secours — un repli en dur serait une seconde vérité, et ce projet s'est fait mordre deux fois par exactement ça (le profil v1 figé dans un réglage, le `slot` déclaré par un convertisseur). Le service TSL et le service SW-P-08 peuvent désormais lire le catalogue au même endroit que le slot.",
+      "`/api/emberplus/profile` est CONSERVÉE, parce que les UI du SNP et du Neuron l'appellent en dur pour peupler leur menu de mapping : en GET elle sert le catalogue lu, en POST elle RELAIE vers `ipg/profile`. Le service ne l'écrit plus — il n'en est plus le propriétaire, et deux écrivains sur un même catalogue redonneraient la double vérité que la 0.17.0 a supprimée pour le slot.",
+      "Le réglage `emberplus_profile` disparaît des `settings_keys` : la couche IPG le reprend UNE fois, l'inscrit à son registre, et il n'est plus jamais relu. Une surcharge posée sur une instance en service n'est donc pas perdue au passage."
     ],
-    "Nouveautés": [],
+    "Corrections": [],
     "Bugs connus": [
+      "Catalogue indisponible ET jamais lu depuis le démarrage → la racine 1000 n'est pas émise du tout, et le contributeur `ipg` le dit en toutes lettres. C'est voulu (sans couche IPG il n'y a aucun slot affecté, donc un moule vide est la vérité et non une dégradation), mais ça n'a PAS été éprouvé sur un contrôleur en service : à confirmer avant de compter dessus.",
       "Le barreau 4 (arbre identique entre deux devices sur un même slot) est franchi, mais il est vrai PAR CONSTRUCTION depuis la grille pleine : il valide que les chemins survivent au remplacement, pas que les machines soient équivalentes."
     ]
   }

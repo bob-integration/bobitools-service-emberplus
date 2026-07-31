@@ -120,11 +120,11 @@ _status = {
 _tree_lock = threading.Lock()
 # Dernier sous-arbre CONNU par contributeur. Sert de repli quand `ember/tree` échoue ou déborde
 # du délai : mesuré le 2026-07-29, le `ember/tree` du SNP met 4 à 9 s pour 687 ko et sautait donc
-# une fois sur deux, faisant disparaître tout son sous-arbre du pupitre.
+# une fois sur deux, faisant disparaître tout son sous-arbre du contrôleur.
 #
 # Un cache en MÉMOIRE : il ne protège donc qu'APRÈS un premier succès.
 # Redémarrer l'application pendant qu'un équipement est éteint faisait disparaître son
-# sous-arbre du pupitre — et c'est la STRUCTURE qui casse une configuration VSM, pas des
+# sous-arbre du contrôleur — et c'est la STRUCTURE qui casse une configuration VSM, pas des
 # valeurs périmées. On persiste donc la RÉPONSE BRUTE de `ember/tree` par contributeur, et
 # pas les structures dérivées : c'est plus petit, et le rechargement repasse par exactement
 # le même code (`_walk_node`) que si le plugin venait de répondre.
@@ -269,7 +269,7 @@ def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maxim
     #
     # Le drapeau varie donc d'un device à l'autre, et l'arbre n'est plus byte-identique entre
     # deux machines de couverture différente. C'est assumé : VSM s'accroche au CHEMIN
-    # (RELATIVE-OID, §2), pas au drapeau — les chemins câblés au pupitre survivent au
+    # (RELATIVE-OID, §2), pas au drapeau — les chemins câblés sur le contrôleur survivent au
     # remplacement, ce qui est la promesse réelle du moule.
     writable = bool(res.get("writable", True)) and ref is not None
     if res["type"] == "enum":
@@ -309,8 +309,18 @@ def _append_canonical(elements, path_map, contributors, io_state):
                                          "value": <v>, "ref": <opaque>,
                                          "min"?: number, "max"?: number }, ... ] } ] }
     Un outil qui ne répond pas 200 est ignoré. `min`/`max` (binding) priment sur le profil :
-    une borne décrit le matériel, pas le catalogue commun à toutes les familles."""
+    une borne décrit le matériel, pas le catalogue commun à toutes les familles.
+
+    Le CATALOGUE ne vient plus d'ici mais de la couche IPG (`plugins/ipg_generique`), lu par
+    `_profile.get_profile()` — même déménagement que le registre d'affectation en 0.17.0, et
+    pour la même raison (§12.11). S'il est indisponible ET jamais lu depuis le démarrage, on
+    n'émet RIEN sous la racine 1000 : mieux vaut une racine absente, qui se voit, qu'une
+    grille pleine de voies sans un seul paramètre, qui ressemble à un parc éteint."""
     prof = _profile.get_profile()
+    if not (prof.get("blocks") or []):
+        contributors.append({"type": "ipg", "label": "IPG — catalogue indisponible "
+                                                     "(outil « IPG Générique » absent ou muet)"})
+        return
     index = _profile.build_index(prof)
     nslots, nlanes = ipg_io.num_slots(), ipg_io.lanes_per_slot()
     slots = (io_state or {}).get("slots") or {}
@@ -364,7 +374,7 @@ def _append_canonical(elements, path_map, contributors, io_state):
             # Bloc identité (hors profil) : à qui la voie est affectée, en lecture seule.
             # L'occupation vient du SLOT, pas des bindings : une passerelle pure (CDE, Newt)
             # tient un slot et des voies dans les grilles sans mapper une seule clé du
-            # catalogue. La dire « non affectée » aurait été un mensonge au pupitre.
+            # catalogue. La dire « non affectée » aurait été un mensonge au contrôleur.
             _ensure_node(elements, seen, [IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID], "Voie")
             io_dev = io_devices.get(slot)
             occupied = ch is not None or io_dev is not None
@@ -422,7 +432,7 @@ _EMPTY_IO = {"devices": {}, "by_slot": {}, "slots": {}, "numbers": {}}
 def _io_state(force=False):
     """État `ember/io` du parc, avec sa péremption propre (IO_TTL_S). Ne lève jamais : un
     échec de collecte rend le dernier état connu plutôt que de vider les grilles — un
-    contributeur momentanément muet ne doit pas faire disparaître ses crosspoints du pupitre."""
+    contributeur momentanément muet ne doit pas faire disparaître ses crosspoints du contrôleur."""
     with _tree_lock:
         state = _tree_cache.get("io")
         fresh = state is not None and (time.monotonic() - (_tree_cache.get("io_ts") or 0)) < IO_TTL_S
@@ -456,7 +466,7 @@ def _build_tree():
         stale = False
         if not (status == 200 and isinstance(data, dict)):
             # Un contributeur muet, lent ou cassé ne doit PAS faire DISPARAÎTRE son sous-arbre
-            # du pupitre : un nœud qui s'évanouit est bien pire qu'un nœud en retard — VSM perd
+            # du contrôleur : un nœud qui s'évanouit est bien pire qu'un nœud en retard — VSM perd
             # ses chemins, et l'opérateur croit le matériel absent. On rejoue donc le dernier
             # état connu, y compris APRÈS UN REDÉMARRAGE grâce au fichier (le cache mémoire, lui,
             # ne protège qu'après un premier succès dans le processus courant).
@@ -583,7 +593,7 @@ def _service_version():
 
 
 def _uptime_str(started_at):
-    """Durée depuis le démarrage, en texte court et lisible au pupitre.
+    """Durée depuis le démarrage, en texte court et lisible côté contrôleur.
 
     Granularité VOLONTAIREMENT à la minute : ce texte est comparé à chaque cycle pour décider
     d'une poussée. Avec des secondes il changeait à chaque tick, donc émettait un delta en
@@ -606,7 +616,7 @@ def _uptime_str(started_at):
 
 
 def _append_service_node(elements, path_map):
-    """Monte le nœud de service : cadence de poussée (réglable DEPUIS le pupitre) et
+    """Monte le nœud de service : cadence de poussée (réglable DEPUIS le contrôleur) et
     quelques compteurs de diagnostic en lecture seule.
 
     La cadence est AUTO-RÉFÉRENTE — elle règle l'intervalle auquel elle est elle-même
@@ -676,7 +686,7 @@ def _apply_service_setvalue(path, value):
             return True
         settings.set("emberplus_push_interval", v)
         audit_log("emberplus", "push_interval", "%s s" % v, user_id=None, username=EMBER_ACTOR)
-        log.info("emberplus: cadence de poussée portée à %s s depuis le pupitre", v)
+        log.info("emberplus: cadence de poussée portée à %s s depuis le contrôleur", v)
         refresh()
         return True
     log.info("emberplus: setvalue %s ignoré (paramètre de service en lecture seule)", path)
@@ -692,7 +702,7 @@ def _write_allowed(addr):
 
     Le provider est sans authentification — c'est le §11.5, et il pilote désormais des
     centaines de paramètres inscriptibles sur du matériel de production. À défaut de pouvoir
-    authentifier (le protocole ne le prévoit pas), on restreint par adresse : seul le pupitre
+    authentifier (le protocole ne le prévoit pas), on restreint par adresse : seul le contrôleur
     déclaré écrit, tout le monde peut lire. Un consumer de diagnostic ne casse donc pas.
 
     Liste VIDE = aucune restriction, pour ne rien casser sur une installation existante — mais
@@ -777,7 +787,7 @@ def _apply_canon_connect(matrix_path, m, target, sources, op):
     if not ok:
         # Refus : l'état n'a pas bougé côté matériel, mais VSM affiche déjà son crosspoint
         # optimiste. On rediffuse la matrice telle qu'elle est pour que le tally claque en
-        # arrière (§12.3) — sans ça, le pupitre mentirait jusqu'au prochain tick.
+        # arrière (§12.3) — sans ça, le contrôleur mentirait jusqu'au prochain tick.
         _broadcast_matrix(matrix_path, m)
         return False
     audit_log(touched or "emberplus", "ember/connect",
@@ -1030,7 +1040,7 @@ def _process_message(sock, addr, kind, payload):
         elif a["kind"] == "connect":
             if not _write_allowed(addr):
                 log.warning("emberplus: crosspoint REFUSÉ depuis %s (hors liste d'écriture)", addr)
-                # On rediffuse la matrice telle qu'elle est : sans ça le pupitre garderait
+                # On rediffuse la matrice telle qu'elle est : sans ça le contrôleur garderait
                 # à l'écran un crosspoint qui n'a jamais eu lieu (même principe qu'au §12.3).
                 _, matrix_map = _reaggregate()
                 m = matrix_map.get(tuple(a["matrix_path"]))
@@ -1151,7 +1161,7 @@ def boot():
     if settings.get("emberplus_enabled") and not _write_allow_list():
         log.warning("emberplus: AUCUNE restriction d'écriture — n'importe quelle adresse du "
                     "réseau peut écrire sur le matériel. Renseigner `emberplus_write_allow` "
-                    "(Réglages → Ember+) avec l'adresse du pupitre.")
+                    "(Réglages → Ember+) avec l'adresse du contrôleur.")
     try:
         if settings.get("emberplus_enabled"):
             port = int(settings.get("emberplus_port") or 9000)
@@ -1201,7 +1211,7 @@ def register_routes(bp):
                                 % (PUSH_INTERVAL_MIN_S, PUSH_INTERVAL_MAX_S)}), 400
             settings.set("emberplus_push_interval", push)
         # Bornes d'ÉMISSION (§12.9.4). Les AGRANDIR est sûr (on ajoute en fin) ; les réduire
-        # fait disparaître des chemins peut-être déjà câblés au pupitre — d'où l'avertissement
+        # fait disparaître des chemins peut-être déjà câblés sur le contrôleur — d'où l'avertissement
         # côté UI, pas un refus : c'est une décision d'exploitation, pas une erreur.
         structure = False
         for key, field, lo, hi, label in (
@@ -1234,23 +1244,36 @@ def register_routes(bp):
     @bp.route("/api/emberplus/profile", methods=["GET"])
     @require_login
     def emberplus_profile_get():
-        """Profil canonique courant + liste des clés (consommé par l'UI d'exposition
-        des plugins pour peupler le menu déroulant du « moule IPG »)."""
+        """Profil canonique courant + liste des clés (consommé par l'UI d'exposition des
+        plugins pour peupler le menu déroulant du « moule IPG »).
+
+        L'URL est CONSERVÉE bien que le catalogue ait déménagé dans la couche IPG : les UI du
+        SNP et du Neuron l'appellent en dur (`/api/emberplus/profile`). La casser aurait vidé
+        leur menu de mapping — et un menu vide se lit comme « ce matériel ne mappe rien »,
+        c'est-à-dire comme la panne qu'on cherche justement à rendre visible."""
         prof = _profile.get_profile()
-        return jsonify({"profile": prof, "keys": _profile.keys(prof)})
+        return jsonify({"profile": prof, "keys": _profile.keys(prof),
+                        "origin": _profile.origin()})
 
     @bp.route("/api/emberplus/profile", methods=["POST"])
     @require_perm("settings.edit")
     def emberplus_profile_set():
-        """Enregistre un profil canonique édité (« liste exposée »)."""
+        """RELAIS vers la couche IPG, qui détient le catalogue depuis emberplus 0.19.0.
+
+        Le service n'écrit plus le réglage `emberplus_profile` : il n'en est plus le
+        propriétaire, et deux écrivains sur un même catalogue redonneraient la double vérité
+        que la 0.17.0 a supprimée pour le slot."""
         data = request.json or {}
-        if not isinstance(data, dict) or not isinstance(data.get("blocks"), list) \
-                or not data["blocks"]:
-            return jsonify({"error": "profil invalide (blocks requis)"}), 400
-        settings.set("emberplus_profile", json.dumps(data, ensure_ascii=False))
+        types = _profile.profile_types()
+        if not types:
+            return jsonify({"error": "aucune couche IPG installée pour recevoir le catalogue"}), 503
+        status, out = tools.call(types[0], "ipg/profile", "POST", {"profile": data},
+                                 actor="Service Ember+", timeout=10)
+        if status != 200:
+            return jsonify(out if isinstance(out, dict) else {"error": "refus %s" % status}), status
+        _profile.get_profile(force=True)      # le catalogue vient de changer : on ne sert pas l'ancien
         refresh()
         _audit_log("emberplus", "profile",
-                   f"maj profil ({len(data['blocks'])} blocs)",
+                   f"maj profil relayée à {types[0]} ({len(data.get('blocks') or [])} blocs)",
                    user_id=None, username="système")
-        return jsonify({"profile": _profile.get_profile(),
-                        "keys": _profile.keys()})
+        return jsonify(out)
