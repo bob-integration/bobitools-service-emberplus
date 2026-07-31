@@ -1202,8 +1202,40 @@ def register_routes(bp):
     """Expose les routes propres au service (statut + application des réglages).
     Le service POSSÈDE ses routes : elles ne vivent plus dans app/routes.py."""
     from flask import request, jsonify
-    from app.auth import require_login, require_perm
+    from app.auth import require_login, require_perm, current_user
     from app.database import audit_log as _audit_log
+
+    @bp.route("/api/ember/notify", methods=["POST"])
+    def ember_notify():
+        """Un outil signale qu'il a du NEUF. Le service ré-agrège et diffuse le diff.
+
+        Pourquoi ça existe : le SNP nous notifie ses changements en quelques millisecondes
+        (WebSocket, cf. son plugin), mais le service ne le découvrait qu'à son minuteur de
+        `emberplus_push_interval` secondes. Ces secondes-là étaient les dernières du parcours.
+
+        Volontairement SANS granularité : l'appelant dit « quelque chose a bougé chez moi », pas
+        quoi. Transmettre les objets touchés obligerait le service à traduire une structure
+        propre à une famille de matériel en chemins Ember+ — c'est-à-dire à détenir une seconde
+        vérité sur ce que le plugin sait déjà. Le diff de `_diff_elements` fait ce tri sans rien
+        savoir de personne, et ne pousse que les éléments réellement modifiés.
+
+        Auth : session connectée OU jeton partagé, pour les outils en conteneur. Même motif que
+        `/api/mail/send`."""
+        jeton = settings.get("emberplus_notify_token") or ""
+        entete = request.headers.get("X-BT-Ember-Token") or ""
+        if not current_user():
+            if not jeton or entete != jeton:
+                return jsonify({"error": "non autorisé"}), 401
+        # `silent=True` : un appelant qui ne dit pas qui il est reste servi. Refuser un corps
+        # absent transformerait une commodité en source de 400 inexplicables.
+        qui = ((request.get_json(silent=True) or {}).get("type")) or "?"
+        if not is_running():
+            return jsonify({"ok": True, "ignored": "service arrêté"})
+        # En FOND : la ré-agrégation prend ~0,6 s et l'appelant n'a aucune raison de l'attendre.
+        # Il vient de recevoir une notification de son matériel, il a mieux à faire que patienter.
+        threading.Thread(target=refresh, daemon=True).start()
+        log.info("emberplus: %s signale un changement → ré-agrégation", qui)
+        return jsonify({"ok": True})
 
     @bp.route("/api/emberplus/status", methods=["GET"])
     @require_login

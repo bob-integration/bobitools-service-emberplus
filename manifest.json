@@ -32,6 +32,10 @@
     "emberplus_lazy_dir": {
       "type": "bool",
       "default": true
+    },
+    "emberplus_notify_token": {
+      "type": "text",
+      "default": ""
     }
   }
 }
