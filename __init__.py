@@ -526,13 +526,23 @@ def _build_tree():
         _append_canonical(elements, path_map, contributors, io_state)
     except Exception as e:
         log.warning("emberplus: agrégation canonique (IPG) échouée : %s", e)
+    # ⚠ Les GRILLES DE FLUX Ember+ ont été retirées le 2026-07-31 : le routage des signaux et
+    # l'affectation des slots passent désormais par SW-P-08 (§15). Les garder aurait entretenu
+    # deux vérités sur le même crosspoint — et c'est justement pour ne PAS câbler mille
+    # paramètres à la main au pupitre qu'on a choisi un protocole de routeur.
+    #
+    # `ipg_io.apply_connect` RESTE, et ne doit pas partir avec : c'est elle que le service
+    # SW-P-08 appelle pour appliquer un croisement. Seule l'EXPOSITION en matrices disparaît.
+    #
+    # `build_sdp` reste aussi, faute de mieux : les SDP devaient rejoindre chaque voie, mais
+    # aucun plugin ne publie l'association voie ↔ signal IP (une voie porte son routage, pas
+    # ses SDP). Les supprimer d'abord aurait détruit l'information sans remplacement.
     try:
-        matrix_map.update(ipg_io.build_matrices(elements, io_state))
         ipg_io.build_sdp(elements, path_map, io_state)
         ndev = len(io_state.get("devices") or {})
-        contributors.append({"type": "flux", "label": "Grilles de flux (%d IPG)" % ndev})
+        contributors.append({"type": "sdp", "label": "SDP (%d IPG)" % ndev})
     except Exception as e:
-        log.warning("emberplus: grilles de flux échouées : %s", e)
+        log.warning("emberplus: arbre SDP échoué : %s", e)
     try:
         _append_service_node(elements, path_map)
     except Exception as e:
@@ -795,62 +805,6 @@ def _reload_matrix(type_, mpath):
         return None
     return local_mm.get(tuple(mpath))
 
-def _apply_canon_connect(matrix_path, m, target, sources, op):
-    """Crosspoint sur une grille CANONIQUE (1002/1003/1005). À la différence du mode libre, la
-    matrice appartient au service : c'est lui qui traduit les numéros globaux en termes locaux
-    au plugin (§12.4), et qui refuse tout ce que le plan interdit — une source d'un autre slot,
-    une voie hors bornes — sans même déranger le matériel."""
-    with _tree_lock:
-        io_state = _tree_cache.get("io")
-    if not io_state:
-        _reaggregate(force=True)
-        with _tree_lock:
-            io_state = _tree_cache.get("io") or {}
-    ok, touched = ipg_io.apply_connect(m["canon"], target, sources, op, io_state)
-    if not ok:
-        # Refus : l'état n'a pas bougé côté matériel, mais VSM affiche déjà son crosspoint
-        # optimiste. On rediffuse la matrice telle qu'elle est pour que le tally claque en
-        # arrière (§12.3) — sans ça, le contrôleur mentirait jusqu'au prochain tick.
-        _broadcast_matrix(matrix_path, m)
-        return False
-    audit_log(touched or "emberplus", "ember/connect",
-              json.dumps({"grille": m["canon"], "target": target, "sources": sources, "op": op},
-                         ensure_ascii=False)[:400], user_id=None, username=EMBER_ACTOR)
-    log.info("emberplus: connect canonique %s tgt=%s src=%s op=%s", m["canon"], target, sources, op)
-    # Tally immédiat : on ne recharge que le contributeur touché (l'analogue de _reload_matrix),
-    # puis on rediffuse TOUTES les grilles de flux — une commutation d'entrée peut changer une
-    # sortie, et une essence peut en entraîner une autre. Une affectation de slot, elle,
-    # renumérote tout : arbre complet.
-    if m["canon"] == "slot":
-        refresh()
-        return True
-    state2 = ipg_io.reload_type(io_state, touched) if touched else None
-    if state2 is None:
-        refresh()
-        return True
-    _rebuild_canon_matrices(state2)
-    return True
-
-
-def _rebuild_canon_matrices(state):
-    """Reconstruit les grilles de flux depuis un état rechargé et les rediffuse tout de suite."""
-    try:
-        fresh = ipg_io.build_matrices([], state)     # [] : on jette les nœuds « Infos », déjà émis
-    except Exception as e:
-        log.warning("emberplus: reconstruction des grilles échouée : %s", e)
-        refresh()
-        return
-    with _tree_lock:
-        _tree_cache["io"] = state
-        _tree_cache["io_ts"] = time.monotonic()   # l'état vient d'être relu : sa péremption repart
-        for path, entry in fresh.items():
-            if path in _tree_cache["matrix_map"]:
-                _tree_cache["matrix_map"][path] = entry
-    for path, entry in fresh.items():
-        if entry.get("canon") != "slot":
-            _broadcast_matrix(list(path), entry)
-
-
 def _apply_connect(matrix_path, target, sources, operation):
     """Route un crosspoint (consumer→provider) vers l'outil propriétaire de la matrice."""
     _, matrix_map = _reaggregate()      # tables seules : pas besoin d'encoder l'arbre
@@ -859,8 +813,9 @@ def _apply_connect(matrix_path, target, sources, operation):
         log.info("emberplus: connect %s ignoré (matrice inconnue)", matrix_path)
         return False
     op = _OP_NAME.get(operation, "absolute")
-    if m.get("canon"):
-        return _apply_canon_connect(matrix_path, m, target, sources, op)
+    # Plus de matrice canonique : les grilles IPG ne sont plus exposées en Ember+ (SW-P-08).
+    # Ne restent ici que les matrices des outils en mode LIBRE — un SNP exposé en direct, par
+    # exemple —, qui gardent leur propre chemin d'écriture.
     status, data = tools.call(m["type"], "ember/connect", "POST",
                               {"ref": m["ref"], "target": target,
                                "sources": sources, "operation": op}, actor=EMBER_ACTOR)

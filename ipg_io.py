@@ -418,24 +418,6 @@ def _connect(connections, seen, target, source, where):
     connections.append({"target": target, "sources": [source]})
 
 
-def _infos_node(elements, root, legende):
-    """Nœud « Infos » voisin de la matrice : la légende de numérotation, en LECTURE SEULE.
-    La `description` d'une matrice sert de NOM DE GRILLE au pupitre (§9) — y entasser une
-    légende la rend illisible, d'où ce nœud séparé. Et puisque les libellés de signaux ne
-    partent PAS sur le fil (§12.9.1), cette légende est la seule documentation que VSM voit."""
-    elements.append(([root, INFOS_ID], "node", "Infos", ""))
-    elements.append(([root, INFOS_ID, 1], "param", "Légende", "", legende, glow.PT_STRING, False))
-
-
-_LEGENDE_COMMUNE = ("Bloc de 100 par slot : les centaines donnent le slot IPG, les unités le "
-                    "signal (1..50 SDI/BNC ou voies, 51..99 Rx/Tx IP). 1 = Désactivé. "
-                    "Sources et destinations sont deux numérotations indépendantes.")
-_LEGENDE_AUDIO = (" Audio 1 garde les numéros de base ; AUDIO 2 = numéro + 10000 (10101, "
-                  "10153…). Les deux vivent dans la même grille pour rester intervertibles : "
-                  "croiser l'audio 2 d'une source vers l'entrée audio 1 d'une voie est un "
-                  "geste normal.")
-
-
 def _essence_src(src, default_essence):
     """Essence portée par une extrémité de crosspoint, vidéo par défaut (§12.10)."""
     e = str((src or {}).get("essence") or default_essence)
@@ -467,150 +449,16 @@ def _source_number(spec, slot, src, essence):
     return None
 
 
-def _build_grid_in(spec, elements, state):
-    """Grille d'entrées de voies. Destinations = l'entrée de chaque voie ; sources = les
-    connecteurs d'entrée + les pseudo-sources. GRILLE PLEINE : tous les numéros du plan sont
-    présents, qu'un device soit posé ou non — VSM reste configurable d'avance et la forme de
-    la matrice ne bouge jamais."""
-    nslots, nlanes = num_slots(), lanes_per_slot()
-    targets, sources, connections, seen = [], [], [], {}
-    sources.append({"number": _e(PSEUDO_NONE), "label": "Désactivé"})
-    if spec["pattern"]:
-        sources.append({"number": _e(PSEUDO_PATTERN), "label": "Mire"})
-    for slot in range(1, nslots + 1):
-        key = state["by_slot"].get(slot)
-        dev = state["devices"].get(key) if key else None
-        for essence, off in spec["essences"]:
-            tag = ESSENCE_TAG[essence]
-            for lane in range(1, nlanes + 1):
-                targets.append({"number": _e(off + lane_signal(slot, lane)),
-                                "label": "S%d voie %d%s" % (slot, lane, tag)})
-            for index in range(1, SIG_SDI_MAX + 1):
-                sources.append({"number": _e(off + phys_signal(slot, "sdi", index)),
-                                "label": "S%d SDI %d%s" % (slot, index, tag)})
-            for index in range(1, SIG_IP_MAX + 1):
-                sources.append({"number": _e(off + phys_signal(slot, "ip", index)),
-                                "label": "S%d Rx IP %d%s" % (slot, index, tag)})
-            if not dev:
-                continue
-            for lane, info in (dev.get("lanes") or {}).items():
-                if lane > nlanes:
-                    continue
-                blk = (info.get("in") or {}).get(essence)
-                if not blk:
-                    continue
-                num = _source_number(spec, slot, blk.get("src"), essence)
-                if num is not None:
-                    _connect(connections, seen, _e(off + lane_signal(slot, lane)), _e(num),
-                             spec["label"])
-    return targets, sources, connections
-
-
-def _build_grid_out(spec, elements, state):
-    """Grille de sorties. Destinations = les connecteurs de sortie ; sources = la sortie de
-    chaque voie. Les sorties étant les DESTINATIONS, une même voie peut en alimenter
-    plusieurs : le « SDI et/ou IP » sort gratuitement du fan-out d'une matrice oneToN."""
-    nslots, nlanes = num_slots(), lanes_per_slot()
-    targets, sources, connections, seen = [], [], [], {}
-    sources.append({"number": _e(PSEUDO_NONE), "label": "Désactivé"})
-    for slot in range(1, nslots + 1):
-        key = state["by_slot"].get(slot)
-        dev = state["devices"].get(key) if key else None
-        for essence, off in spec["essences"]:
-            tag = ESSENCE_TAG[essence]
-            for index in range(1, SIG_SDI_MAX + 1):
-                targets.append({"number": _e(off + phys_signal(slot, "sdi", index)),
-                                "label": "S%d BNC %d%s" % (slot, index, tag)})
-            for index in range(1, SIG_IP_MAX + 1):
-                targets.append({"number": _e(off + phys_signal(slot, "ip", index)),
-                                "label": "S%d Tx IP %d%s" % (slot, index, tag)})
-            for lane in range(1, nlanes + 1):
-                sources.append({"number": _e(off + lane_signal(slot, lane)),
-                                "label": "S%d voie %d%s" % (slot, lane, tag)})
-            if not dev:
-                continue
-            for lane, info in (dev.get("lanes") or {}).items():
-                if lane > nlanes:
-                    continue
-                blk = (info.get("out") or {}).get(essence)
-                if not blk:
-                    continue
-                for dst in blk.get("dst") or []:
-                    kind = str(dst.get("kind") or "").lower()
-                    try:
-                        index = int(dst.get("index"))
-                    except (TypeError, ValueError):
-                        continue
-                    limit = SIG_SDI_MAX if kind == "sdi" else SIG_IP_MAX
-                    if kind not in ("sdi", "ip") or not (1 <= index <= limit):
-                        continue
-                    doff = _ess_offset(spec, _essence_src(dst, essence))
-                    if doff is None:
-                        continue
-                    _connect(connections, seen, _e(doff + phys_signal(slot, kind, index)),
-                             _e(off + lane_signal(slot, lane)), spec["label"])
-    return targets, sources, connections
-
-
-def build_grid(spec, elements, state):
-    """Une grille de flux : son nœud racine, sa légende, et l'entrée matrix_map qui va avec."""
-    if spec["dir"] == "in":
-        targets, sources, connections = _build_grid_in(spec, elements, state)
-        legende = _LEGENDE_COMMUNE + (" Une voie ne peut être alimentée que par un connecteur "
-                                      "de SON slot ; toute autre demande est refusée.")
-    else:
-        targets, sources, connections = _build_grid_out(spec, elements, state)
-        legende = _LEGENDE_COMMUNE + (" Une sortie ne peut être alimentée que par une voie de "
-                                      "SON slot. Une même voie peut alimenter plusieurs sorties.")
-    if len(spec["essences"]) > 1:
-        legende += _LEGENDE_AUDIO
-    elements.append(([spec["root"]], "node", spec["label"], ""))
-    _infos_node(elements, spec["root"], legende)
-    return {"type": None, "canon": spec["canon"], "ref": None, "label": spec["label"],
-            "decl": {"type": "oneToN", "description": spec["label"],
-                     "targets": targets, "sources": sources, "connections": connections}}
-
-
-def build_grid_slots(elements, state):
-    """Grille d'affectation (racine 1010) « Affectation IPG ». Destinations = les slots ; sources = les devices connus.
-    C'est elle qui rend le slot pilotable au pupitre — et comme le numéro d'un signal DIT son
-    slot, déplacer un device ici renumérote tous ses signaux et toutes ses voies (§12.8)."""
-    nslots = num_slots()
-    targets = [{"number": _e(s), "label": "Slot %d" % s} for s in range(1, nslots + 1)]
-    sources = [{"number": _e(PSEUDO_NONE), "label": "Aucun"}]
-    connections = []
-    numbers = state.get("numbers") or {}
-    for key in sorted(numbers, key=lambda k: numbers[k]):
-        dev = state["devices"].get(key)
-        label = dev.get("label") if dev else key
-        sources.append({"number": _e(DEV_SRC_OFFSET + numbers[key]),
-                        "label": "%s%s" % (label, "" if dev else " (absent)")})
-    for slot, key in (state.get("by_slot") or {}).items():
-        if slot <= nslots and key in numbers:
-            connections.append({"target": _e(slot),
-                                "sources": [_e(DEV_SRC_OFFSET + numbers[key])]})
-    elements.append(([GRID_SLOT_ROOT_ID], "node", "Affectation IPG", ""))
-    _infos_node(elements, GRID_SLOT_ROOT_ID,
-                "Pose un IPG sur un slot. 1 = Aucun (vide le slot), puis 11, 12… = les devices "
-                "connus. Un slot porte un device à la fois ; affecter un device déjà posé "
-                "ailleurs le DÉPLACE. Attention : déplacer un device renumérote tous ses "
-                "signaux et toutes ses voies — opération hors service, pas un geste de "
-                "production.")
-    return {"type": None, "canon": "slot", "ref": None, "label": "Affectation IPG",
-            "decl": {"type": "oneToN", "description": "Affectation IPG",
-                     "targets": targets, "sources": sources, "connections": connections}}
-
-
-def build_matrices(elements, state):
-    """Les sept matrices canoniques, indexées par leur chemin (prêtes pour matrix_map)."""
-    out = {(spec["root"], MATRIX_ID): build_grid(spec, elements, state) for spec in GRID_SPECS}
-    out[(GRID_SLOT_ROOT_ID, MATRIX_ID)] = build_grid_slots(elements, state)
-    return out
-
-
-# ═════════════════════════════════════════════════════════════════════
-# Arbre des SDP (racine 1100)
-# ═════════════════════════════════════════════════════════════════════
+# ⚠ Les constructeurs de MATRICES Ember+ ont été retirés le 2026-07-31 — `build_grid`,
+# `build_grid_slots`, `build_matrices`. Le routage des signaux et l'affectation des slots
+# passent par SW-P-08 (cf. §15 de EMBERPLUS-IPG.md) : exposer les mêmes croisements en Ember+
+# aurait entretenu deux vérités sur le même point, et c'est justement pour éviter de câbler
+# mille paramètres un par un au pupitre qu'on a pris un protocole de routeur.
+#
+# Ce qui RESTE, et qui n'a rien à voir : `GRID_SPECS`, `_SPEC_BY_CANON` et `apply_connect`.
+# C'est la LOGIQUE d'application d'un croisement, appelée par le service SW-P-08 — les
+# supprimer avec l'exposition aurait coupé le routage. Les racines 1010 à 1016 ne sont donc
+# plus émises, mais restent RÉSERVÉES : les réattribuer casserait des chemins de contrôleur.
 
 def build_sdp(elements, path_map, state):
     """`<racine SDP> / slot / (1 = Rx, 2 = Tx) / index / essence / {SDP, Flux présent, Actif}`.
