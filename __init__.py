@@ -401,6 +401,18 @@ def _append_canonical(elements, path_map, contributors, io_state):
             # id de feuille = bloc×100 + param. Les `id` du catalogue sont gelés (§ en tête de
             # `profile.py`), donc ce calcul l'est aussi — et il laisse les blocs à deux chiffres
             # sans collision possible avec le bloc d'identité, qui vaut 100.
+            # PREMIER champ de la voie, et le seul qu'on lise d'un coup d'œil : « SNPF1 - C2 »,
+            # soit le nom de l'IPG suivi de la désignation CONSTRUCTEUR du canal. Demandé par
+            # l'exploitant : au pupitre, une voie doit se reconnaître sans avoir à recouper deux
+            # paramètres. Vide tant que le slot n'est pas occupé — un nom sur une voie libre
+            # laisserait croire à une affectation.
+            natif0 = ((io_dev or {}).get("lanes") or {}).get(lane, {}).get("name") \
+                if io_dev else None
+            elements.append(([IPG_ROOT_ID, slot, lane, IDENTITY_BLOCK_ID * 100], "param",
+                             pref + "Ident", "",
+                             ("%s - %s" % (label, natif0 or ("L%02d" % lane))
+                              if label else "") if occupied else "",
+                             glow.PT_STRING, False))
             elements.append(([IPG_ROOT_ID, slot, lane, IDENTITY_BLOCK_ID * 100 + 1], "param",
                              pref + "Ident_Assigned", "", occupied, glow.PT_BOOLEAN, False))
             elements.append(([IPG_ROOT_ID, slot, lane, IDENTITY_BLOCK_ID * 100 + 2], "param",
