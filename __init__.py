@@ -257,7 +257,7 @@ _CANON_DEFAULTS = {"bool": False, "boolean": False, "int": 0, "integer": 0,
                    "real": 0.0, "float": 0.0, "enum": 0}
 
 
-def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maximum):
+def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maximum, ident=None):
     """Émet un paramètre canonique (forme positionnelle enum/bornes de `_encode_element`) et,
     s'il est inscriptible ET porte un `ref`, l'inscrit dans `path_map` (routage du SetValue)."""
     ptype = _TYPE_MAP.get(res["type"], glow.PT_STRING)
@@ -277,7 +277,13 @@ def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maxim
             value = int(value or 0)
         except (TypeError, ValueError):
             value = 0
-    el = (ppath, "param", res["param_label"], "", value, ptype, writable)
+    # IDENTIFIANT et DESCRIPTION sont deux champs distincts, et on s'en sert enfin comme tel :
+    # l'identifiant est machine (« L01_Color_GainR » — anglais, sans espace ni accent, c'est lui
+    # qui se retrouve dans une configuration de contrôleur), la description est humaine
+    # (« Gain R »). Jusqu'ici le libellé servait aux deux, ce qui mettait des accents et des
+    # espaces dans des chemins censés être stables.
+    el = (ppath, "param", ident or res["param_label"], res["param_label"] if ident else "",
+          value, ptype, writable)
     enumeration = res["enum"] if (res["type"] == "enum" and res["enum"]) else None
     # `enumeration` doit précéder les bornes, même à None : forme positionnelle attendue.
     if enumeration is not None or minimum is not None or maximum is not None:
@@ -358,32 +364,47 @@ def _append_canonical(elements, path_map, contributors, io_state):
                     ch = channels.setdefault((slot, lane), {"type": type_, "binds": {}})
                     ch["binds"][b.get("key")] = b
 
-    # 2. Grille pleine, ADRESSÉE PAR SLOT : toutes les voies émettent tout le catalogue.
+    # 2. Grille pleine : IPG → Slot → Lane, et TOUS les paramètres à plat dans la lane.
+    #
+    # ⚠ La profondeur n'est pas un choix esthétique, elle se paie au pupitre. Constaté par
+    # l'exploitant le 2026-07-31 : tout ce qui concerne un IPG doit tenir sous UNE branche,
+    # sinon le câblage se fait branche par branche, en glisser-déposer. L'arbre d'avant
+    # dispersait un même IPG entre sept racines de grilles, un arbre SDP séparé et des voies
+    # pendues à la racine sans niveau slot — soit 288 branches par IPG. Ici, une par IPG.
+    #
+    # Le nœud d'un IPG s'appelle « Slot01 », JAMAIS du nom du matériel qui l'occupe : le chemin
+    # doit survivre à un déménagement de slot (§12.8), sinon une réaffectation casserait tout le
+    # câblage du contrôleur. Le nom du matériel vit dans `Ident_Device`, qui est un paramètre et
+    # a donc le droit de changer.
     seen = set()
     _ensure_node(elements, seen, [IPG_ROOT_ID], prof.get("label") or "IPG")
     nassigned = 0
     for slot in range(1, nslots + 1):
+        _ensure_node(elements, seen, [IPG_ROOT_ID, slot], "Slot%02d" % slot)
         for lane in range(1, nlanes + 1):
-            voie = ipg_io.lane_signal(slot, lane)       # 100×slot + n° local
             ch = channels.get((slot, lane))
             binds = ch["binds"] if ch else {}
             if ch:
                 nassigned += 1
-            _ensure_node(elements, seen, [IPG_ROOT_ID, voie], "S%d voie %d" % (slot, lane))
+            lpath = [IPG_ROOT_ID, slot, lane]
+            _ensure_node(elements, seen, lpath, "L%02d" % lane)
+            pref = "L%02d_" % lane          # rappelé sur CHAQUE feuille, cf. plus bas
 
-            # Bloc identité (hors profil) : à qui la voie est affectée, en lecture seule.
+            # Identité (hors profil) : à qui la voie est affectée, en lecture seule.
             # L'occupation vient du SLOT, pas des bindings : une passerelle pure (CDE, Newt)
             # tient un slot et des voies dans les grilles sans mapper une seule clé du
             # catalogue. La dire « non affectée » aurait été un mensonge au contrôleur.
-            _ensure_node(elements, seen, [IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID], "Voie")
             io_dev = io_devices.get(slot)
             occupied = ch is not None or io_dev is not None
             label = ((io_dev or {}).get("label") or dev_labels.get(slot)
                      or (ch["type"] if ch else "")) if occupied else ""
-            elements.append(([IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID, 1], "param", "Affectée", "",
-                             occupied, glow.PT_BOOLEAN, False))
-            elements.append(([IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID, 2], "param", "Équipement", "",
-                             label, glow.PT_STRING, False))
+            # id de feuille = bloc×100 + param. Les `id` du catalogue sont gelés (§ en tête de
+            # `profile.py`), donc ce calcul l'est aussi — et il laisse les blocs à deux chiffres
+            # sans collision possible avec le bloc d'identité, qui vaut 100.
+            elements.append(([IPG_ROOT_ID, slot, lane, IDENTITY_BLOCK_ID * 100 + 1], "param",
+                             pref + "Ident_Assigned", "", occupied, glow.PT_BOOLEAN, False))
+            elements.append(([IPG_ROOT_ID, slot, lane, IDENTITY_BLOCK_ID * 100 + 2], "param",
+                             pref + "Ident_Device", "", label, glow.PT_STRING, False))
             # « Canal natif » : la désignation que le CONSTRUCTEUR donne à cette voie — « A1 »
             # sur un SNP (processeur + position) ou un Neuron (path). C'est elle que
             # l'exploitant lit sur la face avant, donc c'est elle qui doit apparaître ici ;
@@ -391,7 +412,8 @@ def _append_canonical(elements, path_map, contributors, io_state):
             # nomment pas leurs voies (CDE, Newt) retombent sur ce couple.
             natif = ((io_dev or {}).get("lanes") or {}).get(lane, {}).get("name") \
                 if io_dev else None
-            elements.append(([IPG_ROOT_ID, voie, IDENTITY_BLOCK_ID, 3], "param", "Canal natif", "",
+            elements.append(([IPG_ROOT_ID, slot, lane, IDENTITY_BLOCK_ID * 100 + 3], "param",
+                             pref + "Ident_Channel", "",
                              ("%s · slot %d voie %d" % (natif, slot, lane) if natif
                               else "slot %d · voie %d" % (slot, lane)) if occupied else "",
                              glow.PT_STRING, False))
@@ -400,12 +422,11 @@ def _append_canonical(elements, path_map, contributors, io_state):
             # device expose (valeur + ref → pilotable) ; le reste, et toute voie libre, tombe
             # au défaut.
             for block in prof.get("blocks") or []:
-                bkey, bid, blabel = block.get("key"), block.get("id"), block.get("label")
+                bkey, bid = block.get("key"), block.get("id")
                 if not bkey or bid is None:
                     continue
-                _ensure_node(elements, seen, [IPG_ROOT_ID, voie, bid], blabel or bkey)
-                for p in block.get("params") or []:
-                    pkey, pid = p.get("key"), p.get("id")
+                for pm in block.get("params") or []:
+                    pkey, pid = pm.get("key"), pm.get("id")
                     if not pkey or pid is None:
                         continue
                     res = index.get("%s.%s" % (bkey, pkey))
@@ -421,8 +442,10 @@ def _append_canonical(elements, path_map, contributors, io_state):
                         value = _CANON_DEFAULTS.get(res["type"], "")
                         minimum, maximum = res.get("min"), res.get("max")
                         ref = None
-                    _emit_canon_param(elements, path_map, [IPG_ROOT_ID, voie, bid, pid],
-                                      res, value, ref, minimum, maximum)
+                    _emit_canon_param(elements, path_map,
+                                      [IPG_ROOT_ID, slot, lane, int(bid) * 100 + int(pid)],
+                                      res, value, ref, minimum, maximum,
+                                      ident=pref + res["block_ident"] + "_" + res["param_ident"])
 
     contributors.append({"type": "ipg", "label": "%s (%d slots × %d voies, %d affectée%s)" % (
         prof.get("label") or "IPG", nslots, nlanes, nassigned, "s" if nassigned != 1 else "")})

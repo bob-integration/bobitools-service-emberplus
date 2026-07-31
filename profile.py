@@ -99,6 +99,34 @@ def origin():
     return _origin if _cache is not None else "indisponible"
 
 
+def slug(texte, defaut="X"):
+    """Identifiant Ember+ sûr depuis un texte quelconque : sans accent, sans espace, sans
+    ponctuation. « Activation des signaux » → « ActivationDesSignaux », « gain_r » → « GainR ».
+
+    ⚠ C'est un GARDE-FOU, pas la voie normale. Le catalogue déclare ses `ident` ; celui-ci ne
+    sert qu'aux profils SURCHARGÉS à la main, où rien n'oblige l'auteur à y penser — et où l'on
+    trouve en pratique des clés comme « Activation des signaux », espaces compris. Un identifiant
+    Ember+ qui porte un espace ou un accent produit des chemins de contrôleur qu'on ne peut plus
+    ni citer ni retrouver, et le mal ne se voit qu'au câblage."""
+    import unicodedata
+    base = unicodedata.normalize("NFKD", str(texte or ""))
+    base = "".join(c for c in base if not unicodedata.combining(c))
+    mots = []
+    courant = []
+    for c in base:
+        if c.isalnum():
+            courant.append(c)
+        elif courant:
+            mots.append("".join(courant))
+            courant = []
+    if courant:
+        mots.append("".join(courant))
+    # Un mot déjà en CamelCase ou tout en majuscules est laissé tel quel ; les autres sont
+    # capitalisés, pour que « des signaux » ne devienne pas « dessignaux ».
+    out = "".join(m if (m[:1].isupper() or m.isupper()) else m[:1].upper() + m[1:] for m in mots)
+    return out or defaut
+
+
 def build_index(prof=None):
     """Indexe le profil : { "<bloc>.<param>" : {block_id, block_label, param_id, param_label,
     type, enum, writable, min, max} }. Fonction PURE de dérivation : elle ne connaît aucune
@@ -118,6 +146,11 @@ def build_index(prof=None):
             idx["%s.%s" % (bkey, pkey)] = {
                 "block_id": int(bid), "block_label": str(blabel),
                 "param_id": int(pid), "param_label": str(p.get("label") or pkey),
+                # Segments de l'IDENTIFIANT Ember+ (« Color », « GainR »), distincts des
+                # `label` qui sont là pour être lus. Repli sur la clé si le catalogue n'en
+                # déclare pas : un vieux profil importé doit continuer de produire un arbre.
+                "block_ident": str(block.get("ident") or slug(bkey)),
+                "param_ident": str(p.get("ident") or slug(pkey)),
                 "type": str(p.get("type") or "string").lower(),
                 "enum": [str(x) for x in (p.get("enum") or [])],
                 "writable": bool(p.get("writable", True)),
