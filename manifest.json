@@ -28,6 +28,10 @@
     "emberplus_write_allow": {
       "type": "text",
       "default": ""
+    },
+    "emberplus_lazy_dir": {
+      "type": "bool",
+      "default": true
     }
   }
 }

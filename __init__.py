@@ -584,6 +584,29 @@ def _encoded_body():
         _tree_cache["body"] = body
     return body
 
+def _children_body(path):
+    """Corps d'un GetDirectory sur UN nœud : ses enfants DIRECTS, et rien d'autre.
+
+    ⚠ Ce que faisait le provider avant le 2026-07-31 : répondre l'ARBRE ENTIER à tout
+    GetDirectory, quelle que soit la profondeur demandée. Mesuré avec notre propre lecteur —
+    18 secondes et plusieurs mégaoctets pour obtenir les cinq branches de la racine. Un
+    consommateur qui descend nœud par nœud recevait donc tout l'arbre à chaque pas, et un
+    pupitre qui se reconnecte le reprenait en entier.
+
+    Les éléments portent leur chemin COMPLET (arbre plat qualifié), donc une tranche s'encode
+    exactement comme le tout : on filtre, on encode, rien d'autre à faire."""
+    with _tree_lock:
+        elements = list(_tree_cache.get("elements_list") or [])
+        matrix_map = dict(_tree_cache.get("matrix_map") or {})
+    n = len(path)
+    fils = [e for e in elements if len(e[0]) == n + 1 and list(e[0][:n]) == list(path)]
+    # Les matrices s'annoncent en CONTENTS-SEULS, comme dans le corps racine : leurs axes et
+    # connexions ne partent qu'au GetDirectory qui les vise, sinon le pupitre se déconnecte.
+    extras = [_encode_matrix(p, m, with_axes=False) for p, m in matrix_map.items()
+              if len(p) == n + 1 and list(p[:n]) == list(path)]
+    return glow.build_collection(fils, extra=extras)
+
+
 def _reaggregate(force=False):
     """Ré-agrège si le cache est expiré ou si `force`. N'ENCODE RIEN : le corps n'est produit
     qu'à la demande par `_encoded_body()`. Renvoie (path_map, matrix_map)."""
@@ -1013,12 +1036,23 @@ def _process_message(sock, addr, kind, payload):
         if a["kind"] in ("getdir", "subscribe"):
             with _lock:
                 _subscribed.add(sock)
-            body, _, matrix_map = _current_tree()
+            # ⚠ On n'ENCODE PAS le corps racine ici : `_current_tree()` le produisait à chaque
+            # GetDirectory, y compris pour répondre trois lignes. Seules les tables sont
+            # nécessaires pour choisir la branche ; le corps complet n'est encodé que dans le
+            # repli historique, ci-dessous.
+            _, matrix_map = _reaggregate()
             mp = tuple(a.get("path") or [])
             if mp in matrix_map:                       # GetDirectory SUR une matrice
                 _send_frame(sock, _matrix_body(mp, matrix_map[mp]))
-            else:                                      # racine / nœud → arbre plat
-                _send_frame(sock, body)
+            elif bool(settings.get("emberplus_lazy_dir")):
+                # Réponse À LA DEMANDE : les enfants directs du nœud visé. C'est le
+                # comportement attendu d'un provider, et il évite de repousser tout l'arbre
+                # à chaque pas d'un consommateur qui descend.
+                _send_frame(sock, _children_body(list(mp)))
+            else:
+                # Repli historique : l'arbre entier. Réglage de secours si un contrôleur
+                # s'avérait dépendre de cette poussée massive — le mettre à faux et le dire.
+                _send_frame(sock, _encoded_body())
         elif a["kind"] == "unsubscribe":
             with _lock:
                 _subscribed.discard(sock)
