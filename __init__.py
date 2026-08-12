@@ -47,8 +47,10 @@ EMBER_ACTOR = "Service Ember+"
 # `100×slot + n° local` (§12.2). Une voie ne s'attribue donc plus, elle se calcule : le
 # registre collant d'antan a disparu, et avec lui sa dérive (cf. §12.9.4).
 IPG_ROOT_ID = 1000
-# Racine du nœud de service (le provider s'expose lui-même). Distincte des racines
-# par-plugin (1..k) et de la racine IPG : aucun risque de collision.
+# Ancienne racine du nœud de service. RETIRÉE le 2026-08-12 : le provider se présente
+# désormais SOUS la racine du moule (§19), pour qu'on n'ait pas à ouvrir une seconde branche
+# afin de savoir à qui l'on parle. Conservée RÉSERVÉE, comme 1010-1016 et 1100 : une racine
+# publiée un jour ne se réattribue jamais.
 SERVICE_ROOT_ID = 1001
 # Bloc « identité de voie », monté par le SERVICE (hors profil). id réservé, très au-dessus des
 # blocs du catalogue (1..k) : décrit à qui une voie est affectée, en lecture seule.
@@ -230,7 +232,7 @@ def _assign_roots():
     Amorçage : le registre n'existe pas sur les instances en service, et le reconstituer par
     ordre alphabétique figerait justement le décalage qu'on vient de subir. Les outils DÉJÀ
     VUS dans l'arbre (ceux dont `_raw_trees` porte un sous-arbre, donc les seuls qui aient pu
-    être câblés au pupitre) passent devant les nouveaux venus, et gardent ainsi le numéro
+    être câblés au contrôleur) passent devant les nouveaux venus, et gardent ainsi le numéro
     qu'ils avaient. D'où l'ordre du boot : `_load_raw_trees()` AVANT toute agrégation."""
     reg = _roots_registry()
     taken = set(reg.values()) | _retired_roots()
@@ -274,7 +276,7 @@ def set_root(type_, n):
 
     Le déplacement est un ACTE D'EXPLOITATION, jamais une conséquence d'autre chose : il
     déplace le sous-arbre chez le contrôleur, donc il se demande explicitement. Il sert le cas
-    où un pupitre est déjà câblé sur un numéro qu'on veut voir occupé par tel outil."""
+    où un contrôleur est déjà câblé sur un numéro qu'on veut voir occupé par tel outil."""
     if type_ not in _ember_candidates():
         return False, "outil inconnu, ou ne déclarant pas `ember: true`"
     if not (1 <= n <= ROOT_MAX):
@@ -428,7 +430,7 @@ def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maxim
         path_map[tuple(ppath)] = ref
 
 
-def _append_canonical(elements, path_map, contributors, io_state):
+def _append_canonical(elements, path_map, contributors, io_state, seen):
     """Voie CANONIQUE (« moule IPG »), modèle VIVIER. La racine 1000 porte un nombre FIXE de
     voies (grille pleine, `_num_lanes`), chacune émettant TOUT le catalogue du profil — qu'un
     device y soit affecté ou non. Ainsi VSM peut être configuré avant qu'un équipement soit
@@ -453,8 +455,11 @@ def _append_canonical(elements, path_map, contributors, io_state):
     Le CATALOGUE ne vient plus d'ici mais de la couche IPG (`plugins/ipg_generique`), lu par
     `_profile.get_profile()` — même déménagement que le registre d'affectation en 0.17.0, et
     pour la même raison (§12.11). S'il est indisponible ET jamais lu depuis le démarrage, on
-    n'émet RIEN sous la racine 1000 : mieux vaut une racine absente, qui se voit, qu'une
-    grille pleine de voies sans un seul paramètre, qui ressemble à un parc éteint."""
+    n'émet AUCUN SLOT : mieux vaut une racine sans voies, qui se voit, qu'une grille pleine de
+    voies sans un seul paramètre, qui ressemble à un parc éteint. La racine elle-même est
+    montée par le nœud de service (§19), qui y publie `IPG_Service_Catalog` à
+    « (indisponible) » — c'est justement quand la couche IPG est muette qu'on a besoin de le
+    lire depuis le contrôleur broadcast."""
     prof = _profile.get_profile()
     if not (prof.get("blocks") or []):
         contributors.append({"type": "ipg", "label": "IPG — catalogue indisponible "
@@ -473,6 +478,7 @@ def _append_canonical(elements, path_map, contributors, io_state):
     #    quoi qu'il déclare. Il n'y a plus de repli sur un vœu du plugin — c'était le second
     #    verrou d'exposition, celui qui rendait le slot affiché imprévisible.
     channels = {}        # (slot, lane) -> { canon_key: binding }
+    dev_binds = {}       # slot -> { canon_key: binding } de portée ÉQUIPEMENT (§18)
     dev_labels = {}      # slot -> label lisible du device
     for type_ in _bindings_types():
         status, data = tools.call(type_, "ember/bindings", "GET", actor=EMBER_ACTOR,
@@ -489,17 +495,24 @@ def _append_canonical(elements, path_map, contributors, io_state):
             if dev.get("label"):
                 dev_labels.setdefault(slot, str(dev["label"]))
             for b in dev.get("bindings") or []:
+                # `lane: 0` = portée ÉQUIPEMENT (§18) : la valeur décrit le châssis entier.
+                # ⚠ Surtout pas `int(b.get("lane") or 1)` : 0 est faux en Python, et l'état PTP
+                # d'un SNP se serait retrouvé sur sa seule voie 1 — vrai nulle part.
+                brut = b.get("lane")
                 try:
-                    lane = int(b.get("lane") or 1)
+                    lane = 1 if brut is None else int(brut)
                 except (TypeError, ValueError):
                     continue
-                if 1 <= lane <= ipg_io.LANE_MAX:
+                if lane == 0:
+                    d = dev_binds.setdefault(slot, {"type": type_, "binds": {}})
+                    d["binds"][b.get("key")] = b
+                elif 1 <= lane <= ipg_io.LANE_MAX:
                     ch = channels.setdefault((slot, lane), {"type": type_, "binds": {}})
                     ch["binds"][b.get("key")] = b
 
     # 2. Grille pleine : IPG → Slot → Lane, et TOUS les paramètres à plat dans la lane.
     #
-    # ⚠ La profondeur n'est pas un choix esthétique, elle se paie au pupitre. Constaté par
+    # ⚠ La profondeur n'est pas un choix esthétique, elle se paie au contrôleur. Constaté par
     # l'exploitant le 2026-07-31 : tout ce qui concerne un IPG doit tenir sous UNE branche,
     # sinon le câblage se fait branche par branche, en glisser-déposer. L'arbre d'avant
     # dispersait un même IPG entre sept racines de grilles, un arbre SDP séparé et des voies
@@ -509,11 +522,12 @@ def _append_canonical(elements, path_map, contributors, io_state):
     # doit survivre à un déménagement de slot (§12.8), sinon une réaffectation casserait tout le
     # câblage du contrôleur. Le nom du matériel vit dans `Ident_Device`, qui est un paramètre et
     # a donc le droit de changer.
-    seen = set()
     _ensure_node(elements, seen, [IPG_ROOT_ID], prof.get("label") or "IPG")
     nassigned = 0
     for slot in range(1, nslots + 1):
         _ensure_node(elements, seen, [IPG_ROOT_ID, slot], "Slot%02d" % slot)
+        _emit_slot_device(elements, path_map, slot, prof, index,
+                          io_devices.get(slot), dev_binds.get(slot), dev_labels.get(slot))
         for lane in range(1, nlanes + 1):
             ch = channels.get((slot, lane))
             binds = ch["binds"] if ch else {}
@@ -536,7 +550,7 @@ def _append_canonical(elements, path_map, contributors, io_state):
             # sans collision possible avec le bloc d'identité, qui vaut 100.
             # PREMIER champ de la voie, et le seul qu'on lise d'un coup d'œil : « SNPF1 - C2 »,
             # soit le nom de l'IPG suivi de la désignation CONSTRUCTEUR du canal. Demandé par
-            # l'exploitant : au pupitre, une voie doit se reconnaître sans avoir à recouper deux
+            # l'exploitant : au contrôleur, une voie doit se reconnaître sans avoir à recouper deux
             # paramètres. Vide tant que le slot n'est pas occupé — un nom sur une voie libre
             # laisserait croire à une affectation.
             natif0 = ((io_dev or {}).get("lanes") or {}).get(lane, {}).get("name") \
@@ -598,6 +612,111 @@ def _append_canonical(elements, path_map, contributors, io_state):
     contributors.append({"type": "ipg", "root": IPG_ROOT_ID,
                          "label": "%s (%d slots × %d voies, %d affectée%s)" % (
         prof.get("label") or "IPG", nslots, nlanes, nassigned, "s" if nassigned != 1 else "")})
+
+UI_URL_TTL_S = 300              # l'adresse locale ne change qu'à une reconfiguration réseau
+_ui_url_cache = {"ts": 0.0, "url": ""}
+
+
+def _ui_url():
+    """Adresse de l'interface web, telle qu'un opérateur la taperait dans son navigateur.
+
+    Le réglage `emberplus_ui_url` prime : sur une machine à plusieurs interfaces — le cas
+    NORMAL ici, gestion d'un côté, média de l'autre — la détection automatique rend l'adresse
+    de la route par défaut, qui n'est pas forcément celle par laquelle on joint l'UI. Mieux
+    vaut pouvoir la corriger que publier une adresse plausible et fausse.
+
+    À défaut, on demande au noyau quelle source il emploierait pour sortir : une socket UDP
+    « connectée » ne fait que résoudre la route, elle n'émet AUCUN paquet (et l'adresse visée
+    est TEST-NET-1, réservée à la documentation, donc injoignable par construction)."""
+    forced = str(settings.get("emberplus_ui_url") or "").strip()
+    if forced:
+        return forced
+    now = time.monotonic()
+    if _ui_url_cache["url"] and (now - _ui_url_cache["ts"]) < UI_URL_TTL_S:
+        return _ui_url_cache["url"]
+    ip = ""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("192.0.2.1", 9))
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+    except Exception as e:
+        log.debug("emberplus: adresse locale indéterminable : %s", e)
+    url = "http://%s:%d" % (ip, config.HTTP_PORT) if ip else ""
+    _ui_url_cache.update({"ts": now, "url": url})
+    return url
+
+
+def _emit_slot_device(elements, path_map, slot, prof, index, io_dev, binds, label_fallback):
+    """Ce qui décrit l'IPG ENTIER, à plat sous son nœud de slot (§18).
+
+    Manquait depuis le début : tout le catalogue était implicitement PAR VOIE, si bien que
+    l'état PTP d'un châssis ou son adresse de gestion n'avaient nulle part où aller. Un SNP
+    aurait dû publier trente-deux fois la même valeur — ce que personne n'a fait, et c'est une
+    des raisons pour lesquelles les blocs 8 et 9 sont restés vides.
+
+    Deux origines distinctes, et il faut les garder distinctes :
+      · l'IDENTITÉ (ids 10000+) vient du SERVICE, qui la connaît par `ember/io` — nom, famille,
+        occupation. Aucun plugin n'a à la mapper, exactement comme pour la voie ;
+      · le CATALOGUE de portée `device` (blocs 10-11) vient du MATÉRIEL, par des bindings
+        portant `"lane": 0`.
+
+    Les feuilles sont montées à PLAT sous `Slot01`, à côté des nœuds de voies : leurs ids
+    (bloc×100 + param, donc ≥ 1001) ne peuvent pas entrer en collision avec les numéros de
+    voies (1..50), et l'exploitant voit l'état de l'IPG en ouvrant le slot, sans descendre."""
+    pref = "S%02d_" % slot
+    base = [IPG_ROOT_ID, slot]
+    entree = binds or {}
+    btype = entree.get("type")          # outil à qui adresser une écriture (cf. `ref`)
+    binds = entree.get("binds") or {}
+    occupied = io_dev is not None or bool(binds)
+    label = ((io_dev or {}).get("label") or label_fallback or "") if occupied else ""
+    # La famille se lit dans l'identité GLOBALE publiée par la couche IPG (« snp:3 ») : c'est
+    # elle qui distingue deux matériels que leurs plugins numérotent pareil. Le type d'outil
+    # contributeur, lui, vaut `ipg_generique` pour tout le monde depuis le §12.11 — l'afficher
+    # ne dirait rien à personne au contrôleur.
+    ident_global = str((io_dev or {}).get("device") or "")
+    famille = ident_global.split(":")[0] if ":" in ident_global else ""
+    elements.append((base + [IDENTITY_BLOCK_ID * 100], "param", pref + "Ident", "",
+                     label, glow.PT_STRING, False))
+    elements.append((base + [IDENTITY_BLOCK_ID * 100 + 1], "param", pref + "Ident_Assigned", "",
+                     occupied, glow.PT_BOOLEAN, False))
+    elements.append((base + [IDENTITY_BLOCK_ID * 100 + 2], "param", pref + "Ident_Device", "",
+                     label, glow.PT_STRING, False))
+    elements.append((base + [IDENTITY_BLOCK_ID * 100 + 3], "param", pref + "Ident_Family", "",
+                     famille if occupied else "", glow.PT_STRING, False))
+
+    # Catalogue de portée ÉQUIPEMENT. Grille pleine comme partout : un slot vide publie les
+    # mêmes feuilles, aux mêmes chemins, avec les valeurs par défaut.
+    for block in prof.get("blocks") or []:
+        if block.get("scope") != "device":
+            continue
+        bkey, bid = block.get("key"), block.get("id")
+        if not bkey or bid is None:
+            continue
+        for pm in block.get("params") or []:
+            pkey, pid = pm.get("key"), pm.get("id")
+            if not pkey or pid is None:
+                continue
+            res = index.get("%s.%s" % (bkey, pkey))
+            if not res:
+                continue
+            b = binds.get("%s.%s" % (bkey, pkey))
+            if b is not None:
+                value = b.get("value")
+                minimum = b.get("min") if b.get("min") is not None else res.get("min")
+                maximum = b.get("max") if b.get("max") is not None else res.get("max")
+                ref = (btype, b.get("ref")) if b.get("ref") is not None else None
+            else:
+                value = _CANON_DEFAULTS.get(res["type"], "")
+                minimum, maximum = res.get("min"), res.get("max")
+                ref = None
+            _emit_canon_param(elements, path_map, base + [int(bid) * 100 + int(pid)],
+                              res, value, ref, minimum, maximum,
+                              ident=pref + res["block_ident"] + "_" + res["param_ident"])
+
 
 def _emit_lane_sdp(elements, path_map, slot, lane, pref, dev):
     """Les SDP de la voie, À PLAT dans sa branche (§17).
@@ -671,6 +790,8 @@ def _build_tree():
     path_map = {}
     matrix_map = {}
     contributors = []
+    seen = set()        # nœuds déjà montés, PARTAGÉ : le nœud de service crée la racine du
+                        # moule quand la couche IPG est muette, et ne la duplique pas sinon
     global _raw_trees_dirty
     for idx, type_ in _ember_roots():
         status, data = tools.call(type_, "ember/tree", "GET", actor=EMBER_ACTOR,
@@ -715,13 +836,13 @@ def _build_tree():
     # avec sa propre péremption (cf. IO_TTL_S) — c'est de loin le contributeur le plus lourd.
     io_state = _io_state()
     try:
-        _append_canonical(elements, path_map, contributors, io_state)
+        _append_canonical(elements, path_map, contributors, io_state, seen)
     except Exception as e:
         log.warning("emberplus: agrégation canonique (IPG) échouée : %s", e)
     # ⚠ Les GRILLES DE FLUX Ember+ ont été retirées le 2026-07-31 : le routage des signaux et
     # l'affectation des slots passent désormais par SW-P-08 (§15). Les garder aurait entretenu
     # deux vérités sur le même crosspoint — et c'est justement pour ne PAS câbler mille
-    # paramètres à la main au pupitre qu'on a choisi un protocole de routeur.
+    # paramètres à la main au contrôleur qu'on a choisi un protocole de routeur.
     #
     # `ipg_io.apply_connect` RESTE, et ne doit pas partir avec : c'est elle que le service
     # SW-P-08 appelle pour appliquer un croisement. Seule l'EXPOSITION en matrices disparaît.
@@ -731,7 +852,7 @@ def _build_tree():
     # qu'on croyait l'association voie ↔ signal IP absente du contrat ; elle y était.
     # La racine 1100 reste RÉSERVÉE, comme 1010-1016 : la réattribuer casserait des chemins.
     try:
-        _append_service_node(elements, path_map)
+        _append_service_node(elements, path_map, seen)
     except Exception as e:
         log.warning("emberplus: nœud de service échoué : %s", e)
     # Index par chemin : base de la comparaison incrémentale. Un élément porte à la fois sa
@@ -766,7 +887,7 @@ def _children_body(path):
     GetDirectory, quelle que soit la profondeur demandée. Mesuré avec notre propre lecteur —
     18 secondes et plusieurs mégaoctets pour obtenir les cinq branches de la racine. Un
     consommateur qui descend nœud par nœud recevait donc tout l'arbre à chaque pas, et un
-    pupitre qui se reconnecte le reprenait en entier.
+    contrôleur qui se reconnecte le reprenait en entier.
 
     Les éléments portent leur chemin COMPLET (arbre plat qualifié), donc une tranche s'encode
     exactement comme le tout : on filtre, on encode, rien d'autre à faire."""
@@ -776,7 +897,7 @@ def _children_body(path):
     n = len(path)
     fils = [e for e in elements if len(e[0]) == n + 1 and list(e[0][:n]) == list(path)]
     # Les matrices s'annoncent en CONTENTS-SEULS, comme dans le corps racine : leurs axes et
-    # connexions ne partent qu'au GetDirectory qui les vise, sinon le pupitre se déconnecte.
+    # connexions ne partent qu'au GetDirectory qui les vise, sinon le contrôleur se déconnecte.
     extras = [_encode_matrix(p, m, with_axes=False) for p, m in matrix_map.items()
               if len(p) == n + 1 and list(p[:n]) == list(path)]
     return glow.build_collection(fils, extra=extras)
@@ -858,15 +979,34 @@ def _uptime_str(started_at):
     return "< 1 min"
 
 
-def _append_service_node(elements, path_map):
-    """Monte le nœud de service : cadence de poussée (réglable DEPUIS le contrôleur) et
-    quelques compteurs de diagnostic en lecture seule.
+def _profile_label():
+    """Libellé de la racine du moule. Ne lève jamais : le nœud de service doit pouvoir monter
+    la racine même quand la couche IPG est muette — c'est justement là qu'on en a besoin."""
+    try:
+        return _profile.get_profile().get("label") or "IPG"
+    except Exception:
+        return "IPG"
+
+
+def _append_service_node(elements, path_map, seen):
+    """Monte le nœud de service SOUS LA RACINE DU MOULE (§19) : cadence de poussée (réglable
+    depuis le contrôleur broadcast) et compteurs de diagnostic en lecture seule.
+
+    ⚠ Il vivait sur sa propre racine (1001) jusqu'au 2026-08-12. Ce n'était pas un doublon de
+    trop, c'était une SECONDE PLACE : un exploitant qui ouvre la branche IPG doit pouvoir dire
+    à qui il parle — quelle instance, quelle version, joignable où — sans aller chercher une
+    racine voisine. Même raisonnement qu'au §12.13 pour les grilles et qu'au §17 pour les SDP,
+    appliqué cette fois à ce qu'on LIT en exploitation. La racine 1001 reste RÉSERVÉE.
+
+    Les identifiants sont refaits au passage (`IPG_Service_*`, anglais, sans accent ni espace) :
+    ceux d'avant — « Voies (affectées / total) » — dataient d'avant la règle du §12.13, et les
+    chemins changeant de toute façon, les garder n'aurait servi personne.
 
     La cadence est AUTO-RÉFÉRENTE — elle règle l'intervalle auquel elle est elle-même
-    repoussée. Sans danger grâce aux bornes annoncées (1 s–1 h), qui font refuser une
-    saisie absurde par le consumer lui-même plutôt qu'après coup. Ce paramètre
-    n'appartient à aucun outil : il n'entre donc PAS dans `path_map` (qui route vers un
-    plugin) et son écriture est interceptée en amont par `_apply_service_setvalue`."""
+    repoussée. Sans danger grâce aux bornes annoncées (1 s–1 h), qui font refuser une saisie
+    absurde par le consumer lui-même plutôt qu'après coup. Ce paramètre n'appartient à aucun
+    outil : il n'entre donc PAS dans `path_map` (qui route vers un plugin) et son écriture est
+    interceptée en amont par `_apply_service_setvalue`."""
     with _lock:
         nsub, ncli = len(_subscribed), len(_clients)
         contribs = ", ".join(c.get("type", "") for c in _status.get("contributors") or [])
@@ -880,44 +1020,67 @@ def _append_service_node(elements, path_map):
         io_state = _tree_cache.get("io") or {}
     nslots, nper = ipg_io.num_slots(), ipg_io.lanes_per_slot()
     nlanes = nslots * nper
-    nassigned = sum(1 for s in (io_state.get("by_slot") or {}) if 1 <= s <= nslots) * nper
+    by_slot = io_state.get("by_slot") or {}
+    nassigned = sum(1 for s in by_slot if 1 <= s <= nslots) * nper
+    nocc = sum(1 for s in by_slot if 1 <= s <= nslots)
     # Compté sur l'agrégation en cours, + 1 : la cadence ci-dessous est le seul paramètre
     # inscriptible du nœud de service. Sert à repérer d'un coup d'œil un `writable` mal posé.
     nwrit = sum(1 for el in elements if el[1] == "param" and len(el) > 6 and el[6]) + 1
-    _ensure_node(elements, set(), [SERVICE_ROOT_ID], "Service Ember+")
-    # Identifiant seul, description vide — comme tous les autres paramètres de l'arbre :
-    # VÉRIFIÉ, VSM recopie l'identifiant faute de description, donc un champ suffit.
-    # Les `id` ci-dessous sont des CHEMINS VSM : on n'ajoute qu'EN FIN, jamais au milieu.
-    elements.append(([SERVICE_ROOT_ID, 1], "param", "update interval (s)", "",
+    # La racine du moule existe déjà si le catalogue a répondu ; sinon on la crée ici, avec le
+    # seul nœud de service — c'est justement quand la couche IPG est muette qu'on a besoin de
+    # se diagnostiquer depuis le contrôleur.
+    _ensure_node(elements, seen, [IPG_ROOT_ID], _profile_label())
+    b = IDENTITY_BLOCK_ID * 100     # 10000+ : hors d'atteinte des numéros de slots (1..99)
+    # Les `id` ci-dessous sont des CHEMINS de contrôleur : on n'ajoute qu'EN FIN, jamais au
+    # milieu. Identifiant seul, description vide — VÉRIFIÉ, VSM recopie l'identifiant faute de
+    # description, donc un champ suffit.
+    elements.append(([IPG_ROOT_ID, b], "param", "IPG_Service_UpdateInterval", "",
                      _push_interval(), glow.PT_INTEGER, True, None,
                      PUSH_INTERVAL_MIN_S, PUSH_INTERVAL_MAX_S))
-    elements.append(([SERVICE_ROOT_ID, 2], "param", "Abonnés", "", nsub, glow.PT_INTEGER, False))
-    elements.append(([SERVICE_ROOT_ID, 3], "param", "Clients", "", ncli, glow.PT_INTEGER, False))
-    elements.append(([SERVICE_ROOT_ID, 4], "param", "Contributeurs", "", contribs,
-                     glow.PT_STRING, False))
-    elements.append(([SERVICE_ROOT_ID, 5], "param", "Version", "",
+    elements.append(([IPG_ROOT_ID, b + 1], "param", "IPG_Service_Subscribers", "",
+                     nsub, glow.PT_INTEGER, False))
+    elements.append(([IPG_ROOT_ID, b + 2], "param", "IPG_Service_Clients", "",
+                     ncli, glow.PT_INTEGER, False))
+    elements.append(([IPG_ROOT_ID, b + 3], "param", "IPG_Service_Contributors", "",
+                     contribs, glow.PT_STRING, False))
+    elements.append(([IPG_ROOT_ID, b + 4], "param", "IPG_Service_Version", "",
                      _service_version(), glow.PT_STRING, False))
-    elements.append(([SERVICE_ROOT_ID, 6], "param", "Uptime", "",
+    elements.append(([IPG_ROOT_ID, b + 5], "param", "IPG_Service_Uptime", "",
                      _uptime_str(started), glow.PT_STRING, False))
-    elements.append(([SERVICE_ROOT_ID, 7], "param", "Port", "", port, glow.PT_INTEGER, False))
-    elements.append(([SERVICE_ROOT_ID, 8], "param", "Voies (affectées / total)", "",
+    elements.append(([IPG_ROOT_ID, b + 6], "param", "IPG_Service_Port", "",
+                     port, glow.PT_INTEGER, False))
+    elements.append(([IPG_ROOT_ID, b + 7], "param", "IPG_Service_Lanes", "",
                      "%d / %d" % (nassigned, nlanes), glow.PT_STRING, False))
-    elements.append(([SERVICE_ROOT_ID, 9], "param", "Dernière erreur", "",
+    elements.append(([IPG_ROOT_ID, b + 8], "param", "IPG_Service_LastError", "",
                      str(err) if err else "—", glow.PT_STRING, False))
-    elements.append(([SERVICE_ROOT_ID, 10], "param", "Dernière poussée", "",
+    elements.append(([IPG_ROOT_ID, b + 9], "param", "IPG_Service_LastPush", "",
                      time.strftime("%H:%M:%S", time.localtime(_last_push_ts))
                      if _last_push_ts else "—", glow.PT_STRING, False))
-    elements.append(([SERVICE_ROOT_ID, 11], "param", "Paramètres inscriptibles", "",
+    elements.append(([IPG_ROOT_ID, b + 10], "param", "IPG_Service_Writable", "",
                      nwrit, glow.PT_INTEGER, False))
+    # ─── Les trois qui n'existaient nulle part ───────────────────────────────
+    elements.append(([IPG_ROOT_ID, b + 11], "param", "IPG_Service_Ui", "",
+                     _ui_url() or "—", glow.PT_STRING, False))
+    elements.append(([IPG_ROOT_ID, b + 12], "param", "IPG_Service_Host", "",
+                     socket.gethostname(), glow.PT_STRING, False))
+    # Quel catalogue a bâti CET arbre. La question s'est déjà posée deux fois en exploitation,
+    # et les deux fois une surcharge périmée gelait le moule sans que rien ne le dise. Le
+    # numéro seul ne suffit pas : « v3 (défaut) » et « v3 (complétée) » ne décrivent pas la
+    # même situation, et « (indisponible) » se lit d'un coup d'œil.
+    elements.append(([IPG_ROOT_ID, b + 13], "param", "IPG_Service_Catalog", "",
+                     "v%s · %s" % (_profile.get_profile().get("version") or "?",
+                                    _profile.origin()), glow.PT_STRING, False))
+    elements.append(([IPG_ROOT_ID, b + 14], "param", "IPG_Service_Slots", "",
+                     "%d / %d" % (nocc, nslots), glow.PT_STRING, False))
 
 
 def _apply_service_setvalue(path, value):
     """Intercepte une écriture sur le nœud de service. Renvoie True si le chemin lui
     appartient (traité ou refusé), False pour laisser le routage normal opérer."""
     p = tuple(path)
-    if not p or p[0] != SERVICE_ROOT_ID:
+    if len(p) != 2 or p[0] != IPG_ROOT_ID or p[1] < IDENTITY_BLOCK_ID * 100:
         return False
-    if p == (SERVICE_ROOT_ID, 1):
+    if p == (IPG_ROOT_ID, IDENTITY_BLOCK_ID * 100):
         try:
             v = int(value)
         except (TypeError, ValueError):
@@ -1420,6 +1583,8 @@ def register_routes(bp):
         out["push_interval_setting"] = _push_interval()
         out["slots_count_setting"] = ipg_io.num_slots()
         out["lanes_per_slot_setting"] = ipg_io.lanes_per_slot()
+        out["ui_url_setting"] = str(settings.get("emberplus_ui_url") or "")
+        out["ui_url"] = _ui_url()       # ce qui est réellement publié, détecté ou forcé
         return jsonify(out)
 
     @bp.route("/api/emberplus/roots", methods=["POST"])
@@ -1483,6 +1648,20 @@ def register_routes(bp):
                                 % (label, lo, hi)}), 400
             settings.set(key, v)
             structure = True
+        # Adresse de l'UI publiée à la racine du moule (§19). Un schéma manquant est AJOUTÉ
+        # plutôt que refusé : « 192.168.1.10:5000 » est ce qu'un exploitant tape naturellement,
+        # et le renvoyer en erreur pour un `http://` absent serait de la pédanterie.
+        ui = data.get("ui_url")
+        if ui is not None:
+            ui = str(ui).strip()
+            if ui and "://" not in ui:
+                ui = "http://" + ui
+            if len(ui) > 200:
+                return jsonify({"error": "adresse d'interface trop longue"}), 400
+            if str(settings.get("emberplus_ui_url") or "") != ui:
+                settings.set("emberplus_ui_url", ui)
+                _ui_url_cache["ts"] = 0.0      # forcer la relecture, forcée comme détectée
+                structure = True               # la valeur publiée change → réémettre
         if structure:
             refresh()          # la taille des grilles change la STRUCTURE → réémettre l'arbre
         settings.set("emberplus_enabled", enabled)

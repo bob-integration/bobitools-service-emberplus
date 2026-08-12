@@ -2,7 +2,7 @@
   "license": "GPL-3.0-or-later",
   "id": "emberplus",
   "label": "Ember+",
-  "version": "0.21.0",
+  "version": "0.22.0",
   "description": "Provider Ember+ générique — agrège les contributions des outils déclarant `ember: true` et les expose en Ember+ S101 (TCP). Compatible VSM et autres contrôleurs broadcast. Sans authentification → à filtrer au niveau réseau.",
   "settings_keys": {
     "emberplus_enabled": {
@@ -34,6 +34,10 @@
       "default": true
     },
     "emberplus_notify_token": {
+      "type": "text",
+      "default": ""
+    },
+    "emberplus_ui_url": {
       "type": "text",
       "default": ""
     }

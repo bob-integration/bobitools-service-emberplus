@@ -146,6 +146,11 @@ def build_index(prof=None):
             idx["%s.%s" % (bkey, pkey)] = {
                 "block_id": int(bid), "block_label": str(blabel),
                 "param_id": int(pid), "param_label": str(p.get("label") or pkey),
+                # Portée du bloc (§18) : `"device"` = la valeur décrit le châssis, pas une
+                # voie — elle se monte sous le SLOT et son binding porte `"lane": 0`. Défaut
+                # `"lane"`, ce qu'était tout le catalogue avant la v3 : un profil ancien ou
+                # surchargé continue donc de se rendre exactement comme avant.
+                "scope": "device" if block.get("scope") == "device" else "lane",
                 # Segments de l'IDENTIFIANT Ember+ (« Color », « GainR »), distincts des
                 # `label` qui sont là pour être lus. Repli sur la clé si le catalogue n'en
                 # déclare pas : un vieux profil importé doit continuer de produire un arbre.

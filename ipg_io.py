@@ -315,7 +315,7 @@ def _norm_device(type_, dev):
         "type": type_, "device": str(device), "label": str(dev.get("label") or device),
         "ref": dev.get("ref"), "slot": _int(dev.get("slot")),
         "number": _int(dev.get("number")),
-        # Nom court saisi dans la couche IPG : les protocoles de pupitre plafonnent les
+        # Nom court saisi dans la couche IPG : les protocoles de contrôleur plafonnent les
         # libellés (4, 8 ou 12 caractères en SW-P-08), donc le nom long ne passe pas.
         "short": str(dev.get("short") or "") or None,
         "inputs": _norm_signals(dev.get("inputs"), "%s entrée" % type_),
@@ -408,7 +408,7 @@ def reload_type(state, type_):
 
 def _connect(connections, seen, target, source, where):
     """Pose une connexion en garantissant UNE seule source par destination : la matrice est
-    `oneToN`, deux connexions sur la même cible donneraient un tally ambigu au pupitre. Un
+    `oneToN`, deux connexions sur la même cible donneraient un tally ambigu au contrôleur. Un
     plugin qui se contredit (deux voies revendiquant la même sortie) est journalisé, pas suivi."""
     if target in seen:
         log.warning("emberplus/io: %s — destination %d revendiquée deux fois (source %d "
@@ -453,7 +453,7 @@ def _source_number(spec, slot, src, essence):
 # `build_grid_slots`, `build_matrices`. Le routage des signaux et l'affectation des slots
 # passent par SW-P-08 (cf. §15 de EMBERPLUS-IPG.md) : exposer les mêmes croisements en Ember+
 # aurait entretenu deux vérités sur le même point, et c'est justement pour éviter de câbler
-# mille paramètres un par un au pupitre qu'on a pris un protocole de routeur.
+# mille paramètres un par un au contrôleur qu'on a pris un protocole de routeur.
 #
 # Ce qui RESTE, et qui n'a rien à voir : `GRID_SPECS`, `_SPEC_BY_CANON` et `apply_connect`.
 # C'est la LOGIQUE d'application d'un croisement, appelée par le service SW-P-08 — les
@@ -616,7 +616,7 @@ def _ipg_contributor(state):
     ⚠ Il se lit dans le REGISTRE DES OUTILS, pas dans les devices collectés. La couche IPG ne
     publie que les matériels POSÉS sur un slot : les déduire d'eux ferait qu'un parc entièrement
     dépeuplé n'aurait plus de contributeur connu, donc plus aucun moyen de réaffecter quoi que
-    ce soit. Vider le dernier slot serait irréversible depuis le pupitre."""
+    ce soit. Vider le dernier slot serait irréversible depuis le contrôleur."""
     t = next(iter(io_types()), None)
     if t:
         return t
@@ -627,10 +627,10 @@ def _ipg_contributor(state):
 
 
 def _apply_slot(slot, src, state):
-    """Affecte (ou libère) un slot depuis la GRILLE 1010 (le geste au pupitre).
+    """Affecte (ou libère) un slot depuis la GRILLE 1010 (le geste au contrôleur).
 
     Le service ne décide plus rien ici : il TRANSMET à la couche IPG, seule propriétaire du
-    registre (§12.11). C'est ce qui garantit que l'écran de l'outil et le pupitre appliquent
+    registre (§12.11). C'est ce qui garantit que l'écran de l'outil et le contrôleur appliquent
     exactement les mêmes règles — déplacement plutôt que duplication, un seul matériel par
     slot — au lieu de deux implémentations qui divergeraient au premier oubli."""
     if not (1 <= slot <= num_slots()):
