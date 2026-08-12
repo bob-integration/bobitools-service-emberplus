@@ -12,7 +12,8 @@ VSM, un plugin qui choisirait ses numéros ruinerait l'interchangeabilité) :
   1011 / 1012  grilles **vidéo**        entrées de voies / sorties
   1013 / 1014  grilles **audio**        les DEUX audio dans la même grille (cf. §12.10)
   1015 / 1016  grilles **ancillaire**
-  1100         arbre des **SDP**        le connection management, RW sur un récepteur
+  1100         RÉSERVÉ — l'arbre des SDP a été retiré le 2026-08-12, les SDP vivent
+               désormais dans la voie qui les porte (§17). Ne jamais réattribuer.
 
 Les paires sont contiguës et se lisent en bloc ; `1002..1009` et `1017..1099` sont RÉSERVÉS, de
 sorte qu'une essence de plus — ou un futur arbre de paramètres — s'insère sans renuméroter. Ce plan a été arrêté le
@@ -58,7 +59,7 @@ GRID_ANC_IN_ROOT_ID = 1015
 GRID_ANC_OUT_ROOT_ID = 1016
 # 1017..1099 RÉSERVÉS : les paires d'essence à venir ET les futurs arbres de paramètres
 # s'y insèrent sans rien renuméroter. Large à dessein : renuméroter est fatal (§12.2).
-SDP_ROOT_ID = 1100            # arbre des SDP
+SDP_ROOT_ID = 1100            # ancien arbre des SDP — RETIRÉ, racine conservée réservée
 MATRIX_ID = 1                 # sous chaque racine de grille : 1 = la matrice, 2 = « Infos »
 INFOS_ID = 2
 
@@ -77,7 +78,8 @@ AUDIO2_OFFSET = 10000         # §12.10 : l'audio 2 vit au-dessus de tous les nu
 # ─── Essences ──────────────────────────────────────────────────────────────
 ESSENCE_VIDEO = "video"
 ESSENCES = (ESSENCE_VIDEO, "audio1", "audio2", "anc")
-ESSENCE_ID = {ESSENCE_VIDEO: 1, "audio1": 2, "audio2": 3, "anc": 4}   # niveau de l'arbre des SDP
+ESSENCE_ID = {ESSENCE_VIDEO: 1, "audio1": 2, "audio2": 3, "anc": 4}   # ordre GELÉ : il numérote
+                                                                     # les feuilles SDP de la voie
 ESSENCE_LABEL = {ESSENCE_VIDEO: "Vidéo", "audio1": "Audio 1", "audio2": "Audio 2", "anc": "ANC"}
 ESSENCE_TAG = {ESSENCE_VIDEO: "", "audio1": " A1", "audio2": " A2", "anc": " ANC"}
 
@@ -85,12 +87,10 @@ ESSENCE_TAG = {ESSENCE_VIDEO: "", "audio1": " A1", "audio2": " A2", "anc": " ANC
 SLOTS_COUNT_DEFAULT = 16
 LANES_PER_SLOT_DEFAULT = 32
 
-# ─── Arbre SDP ──────────────────────────────────────────────────────
+# ─── Sens d'un signal IP ────────────────────────────────────────────
+# (Les ids de l'ancien arbre SDP sont partis avec lui : les SDP sont dans la voie, §17.)
 SDP_DIR_RX = 1
 SDP_DIR_TX = 2
-SDP_PARAM_SDP = 1
-SDP_PARAM_PRESENT = 2
-SDP_PARAM_ENABLED = 3
 
 # ─── Les six grilles de flux ───────────────────────────────────────────────
 # `essences` = les couples (essence, offset) que la grille porte. Une grille à plusieurs
@@ -460,67 +460,33 @@ def _source_number(spec, slot, src, essence):
 # supprimer avec l'exposition aurait coupé le routage. Les racines 1010 à 1016 ne sont donc
 # plus émises, mais restent RÉSERVÉES : les réattribuer casserait des chemins de contrôleur.
 
-def build_sdp(elements, path_map, state):
-    """`<racine SDP> / slot / (1 = Rx, 2 = Tx) / index / essence / {SDP, Flux présent, Actif}`.
+def lane_ip_essence(dev, lane, essence, direction):
+    """Bloc d'essence du signal IP porté par une VOIE (`{sdp, present, enabled, ref}`), ou None.
 
-    ⚠ EXCEPTION ASSUMÉE au principe de grille pleine (§12.7) : on n'émet QUE les signaux
-    réellement déclarés. Un SDP pèse 1 à 2 ko ; le vivier complet en ferait plusieurs Mo à
-    chaque GetDirectory. Les CHEMINS restent déterministes — VSM peut être câblé d'avance —
-    seule la présence suit le parc."""
-    nslots = num_slots()
-    root_done = False
-    for slot in sorted(state.get("by_slot") or {}):
-        if slot > nslots:
-            continue
-        key = state["by_slot"][slot]
-        dev = state["devices"].get(key)
-        if not dev:
-            continue
-        slot_done = False
-        for direction, signals in ((SDP_DIR_RX, dev.get("inputs")),
-                                   (SDP_DIR_TX, dev.get("outputs"))):
-            ip_sigs = [s for s in (signals or []) if s.get("kind") == "ip"]
-            if not ip_sigs:
-                continue
-            if not root_done:
-                elements.append(([SDP_ROOT_ID], "node", "SDP", ""))
-                root_done = True
-            if not slot_done:      # une seule fois : les deux sens partagent le nœud de slot
-                elements.append(([SDP_ROOT_ID, slot], "node",
-                                 dev.get("label") or "Slot %d" % slot, ""))
-                slot_done = True
-            elements.append(([SDP_ROOT_ID, slot, direction], "node",
-                             "Récepteurs" if direction == SDP_DIR_RX else "Émetteurs", ""))
-            for s in ip_sigs:
-                base = [SDP_ROOT_ID, slot, direction, SIG_IP_OFFSET + s["index"]]
-                default = ("Rx %d" if direction == SDP_DIR_RX else "Tx %d") % s["index"]
-                elements.append((base, "node", s.get("label") or default, ""))
-                for essence in ESSENCES:
-                    blk = (s.get("essences") or {}).get(essence)
-                    if not blk:
-                        continue
-                    _emit_sdp_essence(elements, path_map, base, essence, blk, dev, direction)
+    L'association voie ↔ signal IP n'a jamais eu besoin d'être publiée à part : elle est déjà
+    dans le contrat du §12.4, où une voie nomme ses sources (`in.src`, `in.allowed`) et ses
+    destinations (`out.dst`) par `{kind, index}`. On la LIT donc, plutôt que de demander aux
+    plugins une clé de plus — les trois familles qui ont des signaux IP la publient déjà.
 
-
-def _emit_sdp_essence(elements, path_map, base, essence, blk, dev, direction):
-    """Les trois paramètres d'une essence d'un signal IP."""
-    epath = base + [ESSENCE_ID[essence]]
-    elements.append((epath, "node", ESSENCE_LABEL[essence], ""))
-    ref = blk.get("ref")
-    # SDP inscriptible sur un RÉCEPTEUR : l'écrire EST l'acte de routage. Sur un émetteur il
-    # décrit ce qu'on produit — lecture seule.
-    writable = bool(ref is not None and direction == SDP_DIR_RX)
-    elements.append((epath + [SDP_PARAM_SDP], "param", "SDP", "",
-                     str(blk.get("sdp") or ""), glow.PT_STRING, writable))
-    if writable:
-        path_map[tuple(epath + [SDP_PARAM_SDP])] = (dev["type"], ref, "sdp")
-    elements.append((epath + [SDP_PARAM_PRESENT], "param", "Flux présent", "",
-                     bool(blk.get("present")), glow.PT_BOOLEAN, False))
-    en_writable = ref is not None and blk.get("enabled") is not None
-    elements.append((epath + [SDP_PARAM_ENABLED], "param", "Actif", "",
-                     bool(blk.get("enabled")), glow.PT_BOOLEAN, bool(en_writable)))
-    if en_writable:
-        path_map[tuple(epath + [SDP_PARAM_ENABLED])] = (dev["type"], ref, "enabled")
+    Côté réception on regarde la source COURANTE puis les sources possibles : une voie dont
+    l'entrée est commutée sur son BNC garde son récepteur IP, et son SDP reste ce qu'il faut
+    écrire pour l'y abonner. Côté émission, le SNP comme le CDE épinglent leur Tx 2110 dans
+    `out.dst` — il n'y a rien à choisir."""
+    l = (dev.get("lanes") or {}).get(lane) if dev else None
+    if not l:
+        return None
+    blk = (l.get("in" if direction == SDP_DIR_RX else "out") or {}).get(essence)
+    if not blk:
+        return None
+    cands = ([blk.get("src")] + list(blk.get("allowed") or [])
+             if direction == SDP_DIR_RX else list(blk.get("dst") or []))
+    index = next((c.get("index") for c in cands
+                  if isinstance(c, dict) and c.get("kind") == "ip"), None)
+    if index is None:
+        return None
+    sigs = dev.get("inputs" if direction == SDP_DIR_RX else "outputs") or []
+    sig = next((s for s in sigs if s.get("kind") == "ip" and s.get("index") == index), None)
+    return (sig.get("essences") or {}).get(essence) if sig else None
 
 
 # ═════════════════════════════════════════════════════════════════════

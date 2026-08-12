@@ -53,6 +53,12 @@ SERVICE_ROOT_ID = 1001
 # Bloc « identité de voie », monté par le SERVICE (hors profil). id réservé, très au-dessus des
 # blocs du catalogue (1..k) : décrit à qui une voie est affectée, en lecture seule.
 IDENTITY_BLOCK_ID = 100
+# Blocs SDP de la VOIE (§17). Ids réservés au-dessus du bloc d'identité (100) et très
+# au-dessus du catalogue (1..9), donc sans collision possible : la feuille vaut
+# `bloc×100 + essence×10 + champ`.
+SDP_RX_BLOCK_ID = 101
+SDP_TX_BLOCK_ID = 102
+_SDP_FIELD_SDP, _SDP_FIELD_PRESENT, _SDP_FIELD_ACTIVE = 1, 2, 3
 # Plus haute racine attribuable en mode libre. Au-dessus commencent les racines RÉSERVÉES :
 # 1000 (moule IPG), 1001 (nœud de service), 1010-1016 (anciennes grilles, jamais réattribuées),
 # 1100 (SDP).
@@ -586,9 +592,52 @@ def _append_canonical(elements, path_map, contributors, io_state):
                                       res, value, ref, minimum, maximum,
                                       ident=pref + res["block_ident"] + "_" + res["param_ident"])
 
+            # Les SDP de la voie, dans la même branche que tout le reste (§17).
+            _emit_lane_sdp(elements, path_map, slot, lane, pref, io_dev)
+
     contributors.append({"type": "ipg", "root": IPG_ROOT_ID,
                          "label": "%s (%d slots × %d voies, %d affectée%s)" % (
         prof.get("label") or "IPG", nslots, nlanes, nassigned, "s" if nassigned != 1 else "")})
+
+def _emit_lane_sdp(elements, path_map, slot, lane, pref, dev):
+    """Les SDP de la voie, À PLAT dans sa branche (§17).
+
+    Ils vivaient sous une racine séparée (1100), ce qui obligeait à câbler un même IPG en deux
+    endroits : le §12.13 avait justement regroupé l'arbre pour qu'un glisser-déposé emporte
+    tout. La raison invoquée alors — « aucun plugin ne publie l'association voie ↔ signal IP » —
+    ne tenait déjà plus : elle se lit dans `lanes[].in/out` (cf. `ipg_io.lane_ip_essence`).
+
+    GRILLE PLEINE, comme le reste de la voie : les feuilles existent même sans device, vides.
+    C'est le TEXTE d'un SDP qui pèse (1 à 2 ko), pas la feuille — le chemin reste donc
+    déterministe et VSM se câble avant que le matériel soit là.
+
+    Écriture : le SDP d'un RÉCEPTEUR est inscriptible, l'écrire EST l'acte de routage. Sur un
+    émetteur il décrit ce qu'on produit, donc lecture seule."""
+    for bid, direction in ((SDP_RX_BLOCK_ID, ipg_io.SDP_DIR_RX),
+                           (SDP_TX_BLOCK_ID, ipg_io.SDP_DIR_TX)):
+        tag = "SdpRx" if direction == ipg_io.SDP_DIR_RX else "SdpTx"
+        for essence in ipg_io.ESSENCES:
+            blk = ipg_io.lane_ip_essence(dev, lane, essence, direction) or {}
+            ref = blk.get("ref")
+            eid = ipg_io.ESSENCE_ID[essence] * 10
+            ident = "%s%s_%s" % (pref, tag, essence.capitalize())
+            base = [IPG_ROOT_ID, slot, lane]
+            w_sdp = ref is not None and direction == ipg_io.SDP_DIR_RX
+            p = base + [bid * 100 + eid + _SDP_FIELD_SDP]
+            elements.append((p, "param", ident, "", str(blk.get("sdp") or ""),
+                             glow.PT_STRING, w_sdp))
+            if w_sdp:
+                path_map[tuple(p)] = (dev["type"], ref, "sdp")
+            elements.append((base + [bid * 100 + eid + _SDP_FIELD_PRESENT], "param",
+                             ident + "Present", "", bool(blk.get("present")),
+                             glow.PT_BOOLEAN, False))
+            w_en = ref is not None and blk.get("enabled") is not None
+            p = base + [bid * 100 + eid + _SDP_FIELD_ACTIVE]
+            elements.append((p, "param", ident + "Active", "", bool(blk.get("enabled")),
+                             glow.PT_BOOLEAN, bool(w_en)))
+            if w_en:
+                path_map[tuple(p)] = (dev["type"], ref, "enabled")
+
 
 _EMPTY_IO = {"devices": {}, "by_slot": {}, "slots": {}, "numbers": {}}
 
@@ -677,16 +726,10 @@ def _build_tree():
     # `ipg_io.apply_connect` RESTE, et ne doit pas partir avec : c'est elle que le service
     # SW-P-08 appelle pour appliquer un croisement. Seule l'EXPOSITION en matrices disparaît.
     #
-    # `build_sdp` reste aussi, faute de mieux : les SDP devaient rejoindre chaque voie, mais
-    # aucun plugin ne publie l'association voie ↔ signal IP (une voie porte son routage, pas
-    # ses SDP). Les supprimer d'abord aurait détruit l'information sans remplacement.
-    try:
-        ipg_io.build_sdp(elements, path_map, io_state)
-        ndev = len(io_state.get("devices") or {})
-        contributors.append({"type": "sdp", "root": ipg_io.SDP_ROOT_ID,
-                             "label": "SDP (%d IPG)" % ndev})
-    except Exception as e:
-        log.warning("emberplus: arbre SDP échoué : %s", e)
+    # ⚠ L'ARBRE SDP (racine 1100) a été retiré le 2026-08-12 : les SDP vivent désormais DANS
+    # la voie qui les porte (§17), avec le reste de l'IPG. Il n'était resté séparé que parce
+    # qu'on croyait l'association voie ↔ signal IP absente du contrat ; elle y était.
+    # La racine 1100 reste RÉSERVÉE, comme 1010-1016 : la réattribuer casserait des chemins.
     try:
         _append_service_node(elements, path_map)
     except Exception as e:
