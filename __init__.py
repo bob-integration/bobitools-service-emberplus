@@ -53,6 +53,14 @@ SERVICE_ROOT_ID = 1001
 # Bloc « identité de voie », monté par le SERVICE (hors profil). id réservé, très au-dessus des
 # blocs du catalogue (1..k) : décrit à qui une voie est affectée, en lecture seule.
 IDENTITY_BLOCK_ID = 100
+# Plus haute racine attribuable en mode libre. Au-dessus commencent les racines RÉSERVÉES :
+# 1000 (moule IPG), 1001 (nœud de service), 1010-1016 (anciennes grilles, jamais réattribuées),
+# 1100 (SDP).
+ROOT_MAX = 999
+# Registre des racines du mode libre : {type d'outil: racine}. Cf. `_assign_roots`.
+_ROOTS_SETTING = "emberplus_roots"
+# Racines libérées par un DÉPLACEMENT manuel, définitivement hors circulation (cf. `set_root`).
+_RETIRED_SETTING = "emberplus_roots_retired"
 _VERSION_CACHE = None          # version lue une fois dans le manifeste (cf. _service_version)
 _last_push_ts = None           # horodatage de la dernière trame réellement émise
 
@@ -171,11 +179,130 @@ def _save_raw_trees():
         log.warning("emberplus: écriture de %s échouée : %s", _TREES_FILE, e)
 
 
-def _ember_types():
-    """Types des outils activés déclarant `ember: true`, triés (index racine stable)."""
-    out = [m.get("type") for m in _plugins.all()
-           if m.get("ember") and not _plugins.is_disabled(m.get("type"))]
-    return sorted(t for t in out if t)
+def _ember_candidates():
+    """Types déclarant `ember: true`, DÉSACTIVÉS COMPRIS : un outil désactivé garde sa racine
+    réservée. La lui reprendre reviendrait à la donner à un autre, et le jour où on le
+    réactive il atterrirait ailleurs — un aller-retour sur une case à cocher ne doit pas
+    déplacer un sous-arbre."""
+    return sorted({m.get("type") for m in _plugins.all() if m.get("ember") and m.get("type")})
+
+
+def _roots_registry():
+    """Registre {type: racine} tel qu'il est persisté, nettoyé de ce qui est inexploitable
+    (racine hors plan, doublon). Les entrées d'outils DÉSINSTALLÉS sont conservées : leur
+    numéro reste pris."""
+    raw = settings.get(_ROOTS_SETTING)
+    out, taken = {}, set()
+    if isinstance(raw, dict):
+        for t, n in sorted(raw.items()):
+            try:
+                n = int(n)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(t, str) and t and 1 <= n <= ROOT_MAX and n not in taken:
+                out[t] = n
+                taken.add(n)
+    return out
+
+
+def _assign_roots():
+    """Registre à jour des racines du mode libre, attribuées UNE FOIS et persistées.
+
+    Pourquoi ce registre existe : la racine d'un contributeur se déduisait de son RANG
+    ALPHABÉTIQUE parmi les outils déclarant `ember: true`. Installer un outil renumérotait
+    donc tout ce qui le suit — constaté le 2026-08-12, l'arrivée de `ptz` a déplacé le
+    sous-arbre de `switch_ports` de la racine 2 à la 3, et tout câblage VSM posé dessus
+    pointait dans le vide. Un ordre alphabétique n'est pas un plan de numérotation : il
+    change quand le parc d'outils change, c'est-à-dire au pire moment.
+
+    Trois règles, dans cet ordre d'importance :
+      1. une racine attribuée ne bouge JAMAIS ;
+      2. une racine libérée n'est JAMAIS réattribuée — un trou se voit, alors qu'un numéro
+         recyclé donnerait en silence le câblage d'un outil au sous-arbre d'un autre ;
+      3. un nouveau venu prend le plus petit numéro libre.
+
+    Amorçage : le registre n'existe pas sur les instances en service, et le reconstituer par
+    ordre alphabétique figerait justement le décalage qu'on vient de subir. Les outils DÉJÀ
+    VUS dans l'arbre (ceux dont `_raw_trees` porte un sous-arbre, donc les seuls qui aient pu
+    être câblés au pupitre) passent devant les nouveaux venus, et gardent ainsi le numéro
+    qu'ils avaient. D'où l'ordre du boot : `_load_raw_trees()` AVANT toute agrégation."""
+    reg = _roots_registry()
+    taken = set(reg.values()) | _retired_roots()
+    manquants = [t for t in _ember_candidates() if t not in reg]
+    if not manquants:
+        return reg
+    vus = [t for t in manquants if t in _raw_trees]
+    for t in vus + [t for t in manquants if t not in _raw_trees]:
+        n = next((i for i in range(1, ROOT_MAX + 1) if i not in taken), None)
+        if n is None:
+            log.warning("emberplus: aucune racine libre (1..%d) — %s ne sera pas exposé",
+                        ROOT_MAX, t)
+            continue
+        reg[t] = n
+        taken.add(n)
+        log.info("emberplus: racine %d attribuée à %s (définitive)", n, t)
+    settings.set(_ROOTS_SETTING, reg)
+    return reg
+
+
+def _retired_roots():
+    """Racines RETIRÉES : elles ont porté un sous-arbre, puis leur outil a été déplacé
+    ailleurs. Elles ne sont jamais réattribuées — sans ça, un déplacement rendrait le numéro
+    disponible pour un nouveau venu, qui hériterait en silence du câblage laissé sur place.
+    C'est la règle 2 du registre, appliquée au cas où c'est l'exploitant qui déplace."""
+    raw = settings.get(_RETIRED_SETTING)
+    out = set()
+    if isinstance(raw, list):
+        for n in raw:
+            try:
+                n = int(n)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= n <= ROOT_MAX:
+                out.add(n)
+    return out
+
+
+def set_root(type_, n):
+    """Impose la racine d'un contributeur. Renvoie (ok, message d'erreur).
+
+    Le déplacement est un ACTE D'EXPLOITATION, jamais une conséquence d'autre chose : il
+    déplace le sous-arbre chez le contrôleur, donc il se demande explicitement. Il sert le cas
+    où un pupitre est déjà câblé sur un numéro qu'on veut voir occupé par tel outil."""
+    if type_ not in _ember_candidates():
+        return False, "outil inconnu, ou ne déclarant pas `ember: true`"
+    if not (1 <= n <= ROOT_MAX):
+        return False, "racine hors plan (1..%d)" % ROOT_MAX
+    reg = _assign_roots()
+    occupant = {v: k for k, v in reg.items()}.get(n)
+    if occupant is not None and occupant != type_:
+        return False, "racine %d déjà attribuée à « %s »" % (n, occupant)
+    if n in _retired_roots():
+        return False, ("racine %d retirée du service : elle a déjà porté un sous-arbre, "
+                       "la réattribuer donnerait un câblage existant à un autre outil" % n)
+    ancienne = reg.get(type_)
+    if ancienne == n:
+        return True, None
+    reg[type_] = n
+    settings.set(_ROOTS_SETTING, reg)
+    if ancienne is not None:
+        settings.set(_RETIRED_SETTING, sorted(_retired_roots() | {ancienne}))
+        log.info("emberplus: %s déplacé de la racine %d à %d ; %d retirée du service",
+                 type_, ancienne, n, ancienne)
+    else:
+        log.info("emberplus: racine %d imposée à %s", n, type_)
+    return True, None
+
+
+def _ember_roots():
+    """[(racine, type)] des contributeurs à ÉMETTRE, dans l'ordre des racines."""
+    actifs = {t for t in _ember_candidates() if not _plugins.is_disabled(t)}
+    return sorted((n, t) for t, n in _assign_roots().items() if t in actifs)
+
+
+def _ember_root(type_):
+    """Racine d'un contributeur, ou None s'il n'en a pas."""
+    return _assign_roots().get(type_)
 
 def _bindings_types():
     """Types déclarant `ember_bindings: true` (mode « moule IPG ») : seuls ceux-là sont
@@ -459,7 +586,8 @@ def _append_canonical(elements, path_map, contributors, io_state):
                                       res, value, ref, minimum, maximum,
                                       ident=pref + res["block_ident"] + "_" + res["param_ident"])
 
-    contributors.append({"type": "ipg", "label": "%s (%d slots × %d voies, %d affectée%s)" % (
+    contributors.append({"type": "ipg", "root": IPG_ROOT_ID,
+                         "label": "%s (%d slots × %d voies, %d affectée%s)" % (
         prof.get("label") or "IPG", nslots, nlanes, nassigned, "s" if nassigned != 1 else "")})
 
 _EMPTY_IO = {"devices": {}, "by_slot": {}, "slots": {}, "numbers": {}}
@@ -495,7 +623,7 @@ def _build_tree():
     matrix_map = {}
     contributors = []
     global _raw_trees_dirty
-    for idx, type_ in enumerate(_ember_types(), start=1):
+    for idx, type_ in _ember_roots():
         status, data = tools.call(type_, "ember/tree", "GET", actor=EMBER_ACTOR,
                                   timeout=TREE_CALL_TIMEOUT_S)
         stale = False
@@ -529,7 +657,10 @@ def _build_tree():
         elements += sub
         path_map.update(pm)
         matrix_map.update(mm)
-        contributors.append({"type": type_, "label": label})
+        # `root` : le numéro de racine est ce que le contrôleur voit, et il est désormais
+        # stable — donc il vaut la peine d'être LISIBLE sans ouvrir la base. `movable` le
+        # distingue des racines FIXES (moule IPG, service, SDP), qui ne se déplacent pas.
+        contributors.append({"type": type_, "label": label, "root": idx, "movable": True})
     # État des entrées/sorties du parc : il sert au moule (résolution des slots), aux six
     # grilles de flux, à l'arbre des SDP et à la grille d'affectation. Une seule collecte,
     # avec sa propre péremption (cf. IO_TTL_S) — c'est de loin le contributeur le plus lourd.
@@ -552,7 +683,8 @@ def _build_tree():
     try:
         ipg_io.build_sdp(elements, path_map, io_state)
         ndev = len(io_state.get("devices") or {})
-        contributors.append({"type": "sdp", "label": "SDP (%d IPG)" % ndev})
+        contributors.append({"type": "sdp", "root": ipg_io.SDP_ROOT_ID,
+                             "label": "SDP (%d IPG)" % ndev})
     except Exception as e:
         log.warning("emberplus: arbre SDP échoué : %s", e)
     try:
@@ -823,9 +955,8 @@ def _reload_matrix(type_, mpath):
     """Recharge UNIQUEMENT le contributeur `type_` et renvoie son entrée matrix_map à jour
     pour `mpath`, sans ré-agréger tout l'arbre (donc sans relire les contributeurs lents en
     I/O réseau comme switch_ports). Renvoie None si introuvable/échec → repli sur refresh()."""
-    try:
-        idx = _ember_types().index(type_) + 1   # index racine 1-based, comme _build_tree
-    except ValueError:
+    idx = _ember_root(type_)                    # racine du registre, comme _build_tree
+    if idx is None:
         return None
     status, data = tools.call(type_, "ember/tree", "GET", actor=EMBER_ACTOR,
                               timeout=TREE_CALL_TIMEOUT_S)
@@ -1247,6 +1378,30 @@ def register_routes(bp):
         out["slots_count_setting"] = ipg_io.num_slots()
         out["lanes_per_slot_setting"] = ipg_io.lanes_per_slot()
         return jsonify(out)
+
+    @bp.route("/api/emberplus/roots", methods=["POST"])
+    @require_perm("settings.edit")
+    def emberplus_roots_set():
+        """Impose la racine d'un contributeur du mode libre (§16).
+
+        Sert le cas où un contrôleur est DÉJÀ câblé sur un numéro donné : le registre garantit
+        qu'une racine ne bouge plus toute seule, il fallait encore pouvoir en choisir une. Le
+        refus de collision et le retrait de l'ancien numéro sont dans `set_root` — c'est là que
+        vit la règle, pas dans la route."""
+        data = request.get_json(silent=True) or {}
+        type_ = str(data.get("type") or "")
+        try:
+            n = int(data.get("root"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "racine invalide"}), 400
+        ok, err = set_root(type_, n)
+        if not ok:
+            return jsonify({"error": err}), 400
+        _audit_log("emberplus", "root_set", "%s → %d" % (type_, n),
+                   user_id=None, username=(current_user() or {}).get("username") or "système")
+        refresh()               # le sous-arbre change de place : il faut réémettre
+        _reaggregate(force=True)   # et RENDRE l'état neuf : `refresh` ne fait qu'invalider,
+        return jsonify(status_dict())   # donc sans ça l'écran réafficherait l'ancien numéro
 
     @bp.route("/api/emberplus/apply", methods=["POST"])
     @require_perm("settings.edit")
