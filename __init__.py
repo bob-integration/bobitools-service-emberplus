@@ -392,6 +392,37 @@ _CANON_DEFAULTS = {"bool": False, "boolean": False, "int": 0, "integer": 0,
                    "real": 0.0, "float": 0.0, "enum": 0}
 
 
+def _enum_index(res, value):
+    """Index canonique d'une valeur d'enum. Un contributeur publie soit l'INDEX déjà résolu,
+    soit la VALEUR du device — les deux se rencontrent dans le parc, selon qu'un `enum_map`
+    est aligné ou non dans le modèle d'exposition. Le SNP résout de son côté quand la clé en
+    porte un ; sans `enum_map`, la chaîne arrive telle quelle et c'est ici qu'elle se résout.
+
+    ⚠ Avant le 2026-08-17 la chaîne partait droit dans `int()`, et le `except` la ramenait à 0
+    SANS UN MOT : « Input Source » annonçait BNC sur les 27 voies réellement en IP, et le
+    retour d'un SetValue semblait ne jamais arriver — l'écriture passait pourtant, elle
+    emprunte `path_map`. Un aplatissement muet sur une surface de contrôle est le pire des
+    deux mondes : le contrôleur affiche une valeur fausse avec l'aplomb d'une vraie.
+
+    Le repli à 0 reste — la FORME de l'arbre ne doit pas dépendre d'une valeur live (§5) —
+    mais il se journalise, comme le fait déjà le SNP pour ses propres enums hors mapping."""
+    # `None` / chaîne vide / False : absence de valeur, pas une valeur inconnue. L'ancien
+    # `int(value or 0)` les absorbait déjà — les journaliser noierait le seul cas qui mérite
+    # de se voir, celui d'un device qui annonce un libellé absent du catalogue.
+    if value is None or value == "" or isinstance(value, bool):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+    s = str(value).strip().lower()
+    for i, v in enumerate(res.get("enum") or []):
+        if str(v).strip().lower() == s:
+            return i
+    log.info("emberplus: enum hors catalogue %s=%r → index 0", res.get("param_label"), value)
+    return 0
+
+
 def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maximum, ident=None):
     """Émet un paramètre canonique (forme positionnelle enum/bornes de `_encode_element`) et,
     s'il est inscriptible ET porte un `ref`, l'inscrit dans `path_map` (routage du SetValue)."""
@@ -408,10 +439,7 @@ def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maxim
     # remplacement, ce qui est la promesse réelle du moule.
     writable = bool(res.get("writable", True)) and ref is not None
     if res["type"] == "enum":
-        try:
-            value = int(value or 0)
-        except (TypeError, ValueError):
-            value = 0
+        value = _enum_index(res, value)
     # IDENTIFIANT et DESCRIPTION sont deux champs distincts, et on s'en sert enfin comme tel :
     # l'identifiant est machine (« L01_Color_GainR » — anglais, sans espace ni accent, c'est lui
     # qui se retrouve dans une configuration de contrôleur), la description est humaine

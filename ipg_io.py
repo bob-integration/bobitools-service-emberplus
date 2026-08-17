@@ -471,22 +471,53 @@ def lane_ip_essence(dev, lane, essence, direction):
     Côté réception on regarde la source COURANTE puis les sources possibles : une voie dont
     l'entrée est commutée sur son BNC garde son récepteur IP, et son SDP reste ce qu'il faut
     écrire pour l'y abonner. Côté émission, le SNP comme le CDE épinglent leur Tx 2110 dans
-    `out.dst` — il n'y a rien à choisir."""
+    `out.dst` — il n'y a rien à choisir.
+
+    ⚠ REPLI SUR LA VIDÉO (2026-08-17). Cette promesse ne tenait que pour la vidéo. Une essence
+    dont la commutation N'EST PAS séparable de celle de la vidéo n'a rien à déclarer dans
+    `allowed` — le SNP publie donc `allowed: []` sur audio 1/2 et ANC (`_lane_essences`), et
+    leur `src` recopie celui de la vidéo. Dès qu'une voie était commutée sur son BNC, le seul
+    candidat était SDI : plus aucun candidat IP, et les SDP audio/ANC de cette voie sortaient
+    vides ET non inscriptibles — exactement l'abonnement qu'on voulait pouvoir armer d'avance.
+    Mesuré le 2026-08-17 sur SNP 1 : 15 feuilles perdues sur 128 (voies 2 et 25-28).
+
+    Le repli ne s'applique QUE si l'essence ne déclare aucun candidat IP : une famille qui
+    porte réellement son audio sur un autre signal IP le dit dans son propre bloc, et garde
+    donc la main. Il ne peut rien écraser — il ne remplit que ce qui était vide."""
     l = (dev.get("lanes") or {}).get(lane) if dev else None
     if not l:
         return None
-    blk = (l.get("in" if direction == SDP_DIR_RX else "out") or {}).get(essence)
+    side = l.get("in" if direction == SDP_DIR_RX else "out") or {}
+    blk = side.get(essence)
     if not blk:
         return None
-    cands = ([blk.get("src")] + list(blk.get("allowed") or [])
-             if direction == SDP_DIR_RX else list(blk.get("dst") or []))
-    index = next((c.get("index") for c in cands
-                  if isinstance(c, dict) and c.get("kind") == "ip"), None)
+    index = _ip_candidate(blk, direction)
+    if index is None and essence != ESSENCE_VIDEO:
+        index = _ip_candidate(side.get(ESSENCE_VIDEO) or {}, direction)
     if index is None:
         return None
     sigs = dev.get("inputs" if direction == SDP_DIR_RX else "outputs") or []
     sig = next((s for s in sigs if s.get("kind") == "ip" and s.get("index") == index), None)
     return (sig.get("essences") or {}).get(essence) if sig else None
+
+
+def _ip_candidate(blk, direction):
+    """Index ENTIER du premier signal IP nommé par une extrémité de voie, ou None.
+
+    ⚠ La coercition en entier n'est pas cosmétique. `_norm_signals` normalise l'index d'un
+    SIGNAL (`int(s.get("index"))`), alors que `src`/`allowed`/`dst` traversent `_in_block` /
+    `_out_block` tels que le plugin les a écrits. Un contributeur qui publierait `"index": "3"`
+    d'un côté et `3` de l'autre ne serait jamais raccordé : `"3" == 3` est faux, et le SDP de
+    la voie sortirait vide sans le moindre message — le même silence que le repli ci-dessus."""
+    cands = ([blk.get("src")] + list(blk.get("allowed") or [])
+             if direction == SDP_DIR_RX else list(blk.get("dst") or []))
+    for c in cands:
+        if isinstance(c, dict) and c.get("kind") == "ip":
+            try:
+                return int(c.get("index"))
+            except (TypeError, ValueError):
+                continue
+    return None
 
 
 # ═════════════════════════════════════════════════════════════════════
