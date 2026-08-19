@@ -61,6 +61,9 @@ IDENTITY_BLOCK_ID = 100
 SDP_RX_BLOCK_ID = 101
 SDP_TX_BLOCK_ID = 102
 _SDP_FIELD_SDP, _SDP_FIELD_PRESENT, _SDP_FIELD_ACTIVE = 1, 2, 3
+# Résumé lisible du flux audio (§21). Champ 4 : l'essence en réserve dix (feuille =
+# bloc×100 + essence×10 + champ), il en restait six.
+_SDP_FIELD_FORMAT = 4
 # Plus haute racine attribuable en mode libre. Au-dessus commencent les racines RÉSERVÉES :
 # 1000 (moule IPG), 1001 (nœud de service), 1010-1016 (anciennes grilles, jamais réattribuées),
 # 1100 (SDP).
@@ -389,7 +392,41 @@ def _ensure_node(elements, seen, path, label):
     elements.append((list(path), "node", str(label), ""))
 
 _CANON_DEFAULTS = {"bool": False, "boolean": False, "int": 0, "integer": 0,
-                   "real": 0.0, "float": 0.0, "enum": 0}
+                   "real": 0.0, "float": 0.0, "enum": None}
+
+# ─── Le « rien » d'un enum a enfin un nom (§22) ─────────────────────────────
+# Une valeur d'enum inconnue retombait sur l'INDEX 0, donc sur la première étiquette du
+# catalogue : « 1080i50 » s'affichait sur les 512 voies d'un parc où personne ne publiait de
+# format vidéo. Un contrôleur ne peut pas distinguer ça d'une mesure — c'est le pire des deux
+# mondes (§5), et l'exploitant l'a signalé le 2026-08-19.
+#
+# On AJOUTE donc une étiquette sentinelle à la FIN de chaque énumération émise. « En fin » est
+# ce qui rend l'opération sûre : les index existants ne bougent pas, donc aucune configuration
+# de contrôleur ne se met à désigner autre chose. L'index de `NC` lui-même n'est PAS un
+# contrat — il se déplace si le catalogue s'enrichit — et il n'a pas à l'être : `NC` n'est
+# jamais une valeur que le contrôleur ÉCRIT (cf. `_canon_enum_write` : elle est refusée), donc
+# jamais une valeur qu'il enregistre.
+ENUM_UNKNOWN_LABEL = "NC"
+
+# Index de `NC` par chemin, pour les seuls enums INSCRIPTIBLES. Reconstruit avec l'arbre
+# (`_build_tree` le vide), donc de même durée de vie que `path_map` et peuplé au même
+# endroit. Il ne sert qu'à REFUSER une écriture : un opérateur voit `NC` dans la liste
+# déroulante — Ember+ n'a aucun moyen de griser une entrée — et rien n'empêcherait de la
+# choisir. L'envoyer au matériel n'aurait aucun sens : `NC` est notre mot, pas le sien.
+_enum_nc = {}
+
+
+def _enum_labels(res):
+    """Énumération ÉMISE : celle du catalogue, plus la sentinelle `NC` en fin. Rendue vide si
+    le catalogue n'en déclare pas — un paramètre sans énumération n'est pas un enum."""
+    base = res.get("enum") or []
+    return list(base) + [ENUM_UNKNOWN_LABEL] if base else []
+
+
+def _enum_unknown(res):
+    """Index de la sentinelle `NC` pour ce paramètre, ou 0 s'il n'a pas d'énumération (auquel
+    cas rien ne s'affiche de toute façon : sans `enumeration`, VSM rend l'entier brut)."""
+    return len(res.get("enum") or [])
 
 
 def _enum_index(res, value):
@@ -404,13 +441,16 @@ def _enum_index(res, value):
     emprunte `path_map`. Un aplatissement muet sur une surface de contrôle est le pire des
     deux mondes : le contrôleur affiche une valeur fausse avec l'aplomb d'une vraie.
 
-    Le repli à 0 reste — la FORME de l'arbre ne doit pas dépendre d'une valeur live (§5) —
-    mais il se journalise, comme le fait déjà le SNP pour ses propres enums hors mapping."""
-    # `None` / chaîne vide / False : absence de valeur, pas une valeur inconnue. L'ancien
-    # `int(value or 0)` les absorbait déjà — les journaliser noierait le seul cas qui mérite
-    # de se voir, celui d'un device qui annonce un libellé absent du catalogue.
+    Le repli reste — la FORME de l'arbre ne doit pas dépendre d'une valeur live (§5) — mais il
+    ne vaut plus 0 : il vaut `NC` (§22). Un aplatissement sur l'index 0 rendait la PREMIÈRE
+    étiquette du catalogue, indiscernable d'une mesure ; la sentinelle, elle, dit ce qu'elle
+    est. Il se journalise toujours, comme le fait le SNP pour ses propres enums hors mapping."""
+    # `None` / chaîne vide / False : absence de valeur. Ce n'est PLUS l'index 0 — c'est
+    # exactement le cas que l'exploitant voulait voir cesser (une voie libre, ou un matériel
+    # qui n'expose pas la clé, annonçait « 1080i50 »). Silencieux, en revanche : ce n'est pas
+    # une anomalie, seulement un blanc, et le journaliser noierait le cas qui mérite de se voir.
     if value is None or value == "" or isinstance(value, bool):
-        return 0
+        return _enum_unknown(res)
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -419,8 +459,8 @@ def _enum_index(res, value):
     for i, v in enumerate(res.get("enum") or []):
         if str(v).strip().lower() == s:
             return i
-    log.info("emberplus: enum hors catalogue %s=%r → index 0", res.get("param_label"), value)
-    return 0
+    log.info("emberplus: enum hors catalogue %s=%r → NC", res.get("param_label"), value)
+    return _enum_unknown(res)
 
 
 def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maximum, ident=None):
@@ -447,7 +487,11 @@ def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maxim
     # espaces dans des chemins censés être stables.
     el = (ppath, "param", ident or res["param_label"], res["param_label"] if ident else "",
           value, ptype, writable)
-    enumeration = res["enum"] if (res["type"] == "enum" and res["enum"]) else None
+    # Énumération ÉMISE = catalogue + sentinelle `NC` (§22). Elle est la MÊME qu'un device
+    # remplisse la clé ou non : c'est ce qui garde l'arbre identique d'une machine à l'autre,
+    # promesse du moule. Seule la VALEUR distingue « je ne sais pas » d'une mesure.
+    enumeration = _enum_labels(res) if res["type"] == "enum" else None
+    enumeration = enumeration or None
     # `enumeration` doit précéder les bornes, même à None : forme positionnelle attendue.
     if enumeration is not None or minimum is not None or maximum is not None:
         el = el + (enumeration,)
@@ -456,6 +500,8 @@ def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maxim
     elements.append(el)
     if writable and ref is not None:
         path_map[tuple(ppath)] = ref
+        if enumeration:
+            _enum_nc[tuple(ppath)] = _enum_unknown(res)
 
 
 def _append_canonical(elements, path_map, contributors, io_state, seen):
@@ -784,6 +830,18 @@ def _emit_lane_sdp(elements, path_map, slot, lane, pref, dev):
                              glow.PT_BOOLEAN, bool(w_en)))
             if w_en:
                 path_map[tuple(p)] = (dev["type"], ref, "enabled")
+            # « 48 kHz / 24 bits / 8 ch » (§21). Sur les essences AUDIO seulement : la vidéo a
+            # déjà ses formats au catalogue, et l'ANC n'a pas de format à dire — leur ajouter
+            # une feuille vide coûterait 2 048 éléments pour rien. C'est le seul champ SDP à
+            # porter une DESCRIPTION : les autres sont des rouages du routage, celui-ci est là
+            # pour être lu.
+            if essence in ipg_io.ESSENCES_AUDIO:
+                elements.append((base + [bid * 100 + eid + _SDP_FIELD_FORMAT], "param",
+                                 ident + "Format",
+                                 "%s %s Format" % (tag[3:].upper(),
+                                                   ipg_io.ESSENCE_LABEL[essence]),
+                                 ipg_io.audio_sdp_summary(blk.get("sdp")),
+                                 glow.PT_STRING, False))
 
 
 _EMPTY_IO = {"devices": {}, "by_slot": {}, "slots": {}, "numbers": {}}
@@ -818,6 +876,7 @@ def _build_tree():
     path_map = {}
     matrix_map = {}
     contributors = []
+    _enum_nc.clear()    # garde-fou d'écriture des enums (§22) : même durée de vie que path_map
     seen = set()        # nœuds déjà montés, PARTAGÉ : le nœud de service crée la racine du
                         # moule quand la couche IPG est muette, et ne la duplique pas sinon
     global _raw_trees_dirty
@@ -1162,6 +1221,19 @@ def _apply_setvalue(path, value):
     if not entry:
         log.info("emberplus: setvalue %s ignoré (inconnu ou lecture seule)", path)
         return False
+    # `NC` est notre mot pour « ce matériel ne le dit pas » (§22), pas une valeur du device.
+    # Ember+ ne sait pas griser une entrée d'énumération : elle apparaît donc dans la liste
+    # déroulante d'un paramètre inscriptible, et on la refuse ICI plutôt que de laisser chaque
+    # famille inventer sa réponse à un index qu'elle ne sait pas traduire.
+    nc = _enum_nc.get(tuple(path))
+    if nc is not None:
+        try:
+            recu = int(value)
+        except (TypeError, ValueError):
+            recu = None
+        if recu == nc:
+            log.info("emberplus: setvalue %s = NC refusé (valeur non écrivable)", path)
+            return False
     # Une entrée porte (type, ref) ; les paramètres de signal IP de l'arbre SDP y ajoutent un
     # `field`, car un même `ref` opaque couvre plusieurs valeurs inscriptibles (§12.7). Le
     # champ reste ABSENT du payload dans tous les autres cas : les plugins du mode libre et du

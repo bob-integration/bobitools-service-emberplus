@@ -33,6 +33,7 @@ Contrat plugin : `GET ember/io` (§12.4, étendu aux essences en §12.10). Un ou
 pas 200 est ignoré en silence.
 """
 import logging
+import re
 
 from app import settings, tools
 from app import plugins as _plugins
@@ -80,6 +81,7 @@ ESSENCE_VIDEO = "video"
 ESSENCES = (ESSENCE_VIDEO, "audio1", "audio2", "anc")
 ESSENCE_ID = {ESSENCE_VIDEO: 1, "audio1": 2, "audio2": 3, "anc": 4}   # ordre GELÉ : il numérote
                                                                      # les feuilles SDP de la voie
+ESSENCES_AUDIO = ("audio1", "audio2")   # les seules à porter un résumé de format (cf. §21)
 ESSENCE_LABEL = {ESSENCE_VIDEO: "Vidéo", "audio1": "Audio 1", "audio2": "Audio 2", "anc": "ANC"}
 ESSENCE_TAG = {ESSENCE_VIDEO: "", "audio1": " A1", "audio2": " A2", "anc": " ANC"}
 
@@ -518,6 +520,59 @@ def _ip_candidate(blk, direction):
             except (TypeError, ValueError):
                 continue
     return None
+
+
+# Première section audio du SDP, puis sa ligne `a=rtpmap` (RFC 4566 :
+# `<encodage>/<fréquence>[/<canaux>]`). Deux motifs plutôt qu'un seul : la borne `m=audio` est
+# ce qui empêche de résumer la vidéo d'un SDP mixte comme si c'était de l'audio.
+_M_AUDIO_RE = re.compile(r"^m=audio\b", re.I | re.M)
+_RTPMAP_RE = re.compile(r"^a=rtpmap:\s*\d+\s+([^/\s]+)/(\d+)(?:/(\d+))?", re.I | re.M)
+_PCM_RE = re.compile(r"^L(\d+)$", re.I)
+
+
+def audio_sdp_summary(sdp):
+    """« 48 kHz / 24 bits / 8 ch » depuis le SDP d'un signal audio, ou `""` (§21).
+
+    Demandé par l'exploitant le 2026-08-19 : au contrôleur, le nombre de canaux d'un flux audio
+    ne se lit NULLE PART — il faut ouvrir le SDP, qui pèse un à deux kilo-octets. L'information
+    y est pourtant déjà, dans la ligne `a=rtpmap`, et c'est la seule source COMMUNE aux
+    familles : le SNP la tient de NMOS, le Newt et le Neuron la lisent sur le matériel. On la
+    résume donc ici plutôt que de demander une clé de plus au contrat du §12.4 — un paramètre
+    dérivé ne coûte rien à personne, une extension de contrat coûte à toutes les familles.
+
+    ⚠ On ne lit QUE la première section `m=audio`. Un flux redondant ST 2022-7 en porte deux,
+    identiques par construction (groupe DUP) : les concaténer afficherait « 8 ch / 8 ch ».
+
+    ⚠ L'encodage n'est pas toujours une largeur d'échantillon. `L16`/`L24` sont du PCM
+    (ST 2110-30), `AM824` est le transport non-PCM du ST 2110-31. On rend alors le mot du SDP
+    tel quel plutôt qu'un nombre de bits inventé — même règle que `status.input_valid` au
+    catalogue : on relaie ce que le flux déclare, on ne le traduit pas au mieux.
+
+    ⚠ Le CDE 1922 n'est PAS servi par cette fonction, et c'est SU. Son SDP est FABRIQUÉ par
+    notre propre plugin (`cde1922/backend.py:_sdp_text`) à partir d'un REST qui ne décrit pas
+    l'essence : il ne porte aucune ligne `a=rtpmap`. Ses voies rendront donc une chaîne vide —
+    un blanc qui se voit, plutôt qu'un « 48 kHz / 24 bits / 2 ch » plausible et faux."""
+    texte = str(sdp or "")
+    debut = _M_AUDIO_RE.search(texte)
+    if not debut:
+        return ""
+    m = _RTPMAP_RE.search(texte, debut.end())
+    if not m:
+        return ""
+    encodage, freq, canaux = m.group(1), m.group(2), m.group(3)
+    bouts = []
+    try:
+        # `%g` rend « 48 » et non « 48.0 », et garde « 44.1 » quand la fréquence l'exige.
+        bouts.append("%g kHz" % (int(freq) / 1000.0))
+    except (TypeError, ValueError):
+        pass
+    pcm = _PCM_RE.match(encodage)
+    bouts.append("%s bits" % pcm.group(1) if pcm else encodage)
+    # Canaux ABSENTS ≠ un canal. La RFC 4566 dit bien « 1 par défaut », mais un SDP 2110-30 qui
+    # tait son compte est assez anormal pour qu'on ne l'affirme pas à la place du matériel.
+    if canaux:
+        bouts.append("%s ch" % canaux)
+    return " / ".join(bouts)
 
 
 # ═════════════════════════════════════════════════════════════════════
