@@ -463,7 +463,26 @@ def _enum_index(res, value):
     return _enum_unknown(res)
 
 
-def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maximum, ident=None):
+def _desc_bloc(dpref, bloc_ident, libelle):
+    """Description d'une feuille de catalogue : « L01 Color Gain R » (§23.4).
+
+    Le bloc vient de l'IDENTIFIANT (`block_ident`) et non du libellé : c'est ce qui fait trier
+    la description exactement comme l'identifiant — `L01_Color_GainR` ↔ « L01 Color Gain R » —
+    et le tri alphabétique d'un contrôleur regroupe alors chaque bloc au lieu d'éparpiller le
+    correcteur couleur entre « Black Level R » (sous B), « Gain R » (G) et « Luma » (L).
+
+    Il n'est PAS répété quand le libellé l'ouvre déjà : la surcharge en service nomme
+    `audio.delay` « Audio Delay » et `Entree.Source d entree` « Input Source », qui donneraient
+    « L01 Audio Audio Delay » et « L01 Input Input Source ». Le mot est le même, le dire deux
+    fois n'ajoute rien au classement et coûte une ligne illisible."""
+    nu, bloc = libelle.strip(), bloc_ident.strip()
+    if nu.lower() == bloc.lower() or nu.lower().startswith(bloc.lower() + " "):
+        return dpref + nu
+    return "%s%s %s" % (dpref, bloc, nu)
+
+
+def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maximum, ident=None,
+                      desc=None):
     """Émet un paramètre canonique (forme positionnelle enum/bornes de `_encode_element`) et,
     s'il est inscriptible ET porte un `ref`, l'inscrit dans `path_map` (routage du SetValue)."""
     ptype = _TYPE_MAP.get(res["type"], glow.PT_STRING)
@@ -483,10 +502,13 @@ def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maxim
     # IDENTIFIANT et DESCRIPTION sont deux champs distincts, et on s'en sert enfin comme tel :
     # l'identifiant est machine (« L01_Color_GainR » — anglais, sans espace ni accent, c'est lui
     # qui se retrouve dans une configuration de contrôleur), la description est humaine
-    # (« Gain R »). Jusqu'ici le libellé servait aux deux, ce qui mettait des accents et des
+    # (« L01 Gain R »). Jusqu'ici le libellé servait aux deux, ce qui mettait des accents et des
     # espaces dans des chemins censés être stables.
-    el = (ppath, "param", ident or res["param_label"], res["param_label"] if ident else "",
-          value, ptype, writable)
+    #
+    # `desc` est le libellé COMPLET, préfixé de la voie ou du slot par l'appelant (§23) ; à
+    # défaut on retombe sur le libellé nu du catalogue, ce qu'émettait la version d'avant.
+    el = (ppath, "param", ident or res["param_label"],
+          desc or (res["param_label"] if ident else ""), value, ptype, writable)
     # Énumération ÉMISE = catalogue + sentinelle `NC` (§22). Elle est la MÊME qu'un device
     # remplisse la clé ou non : c'est ce qui garde l'arbre identique d'une machine à l'autre,
     # promesse du moule. Seule la VALEUR distingue « je ne sais pas » d'une mesure.
@@ -610,6 +632,14 @@ def _append_canonical(elements, path_map, contributors, io_state, seen):
             lpath = [IPG_ROOT_ID, slot, lane]
             _ensure_node(elements, seen, lpath, "L%02d" % lane)
             pref = "L%02d_" % lane          # rappelé sur CHAQUE feuille, cf. plus bas
+            # …et la DESCRIPTION porte le MÊME rappel (§23). Ce n'est pas de la redondance :
+            # un contrôleur affiche la description et ne retombe sur l'identifiant que faute de
+            # description (VÉRIFIÉ sur VSM, cf. `_append_service_node`). Une branche de voie
+            # mélangeait donc deux façons de se nommer — « Gain R », qui ne dit pas sa voie, à
+            # côté de « L01_SdpRx_Video », qui la dit. Signalé par l'exploitant le 2026-08-26.
+            # Le libellé sorti de son arbre, dans une liste de contrôleur broadcast, ne
+            # désignait alors plus rien : trente-deux voies portent le même « Gain R ».
+            dpref = "L%02d " % lane
 
             # Identité (hors profil) : à qui la voie est affectée, en lecture seule.
             # L'occupation vient du SLOT, pas des bindings : une passerelle pure (CDE, Newt)
@@ -630,14 +660,16 @@ def _append_canonical(elements, path_map, contributors, io_state, seen):
             natif0 = ((io_dev or {}).get("lanes") or {}).get(lane, {}).get("name") \
                 if io_dev else None
             elements.append(([IPG_ROOT_ID, slot, lane, IDENTITY_BLOCK_ID * 100], "param",
-                             pref + "Ident", "",
+                             pref + "Ident", dpref + "Ident",
                              ("%s - %s" % (label, natif0 or ("L%02d" % lane))
                               if label else "") if occupied else "",
                              glow.PT_STRING, False))
             elements.append(([IPG_ROOT_ID, slot, lane, IDENTITY_BLOCK_ID * 100 + 1], "param",
-                             pref + "Ident_Assigned", "", occupied, glow.PT_BOOLEAN, False))
+                             pref + "Ident_Assigned", dpref + "Ident Assigned", occupied,
+                             glow.PT_BOOLEAN, False))
             elements.append(([IPG_ROOT_ID, slot, lane, IDENTITY_BLOCK_ID * 100 + 2], "param",
-                             pref + "Ident_Device", "", label, glow.PT_STRING, False))
+                             pref + "Ident_Device", dpref + "Ident Device", label,
+                             glow.PT_STRING, False))
             # « Canal natif » : la désignation que le CONSTRUCTEUR donne à cette voie — « A1 »
             # sur un SNP (processeur + position) ou un Neuron (path). C'est elle que
             # l'exploitant lit sur la face avant, donc c'est elle qui doit apparaître ici ;
@@ -646,7 +678,7 @@ def _append_canonical(elements, path_map, contributors, io_state, seen):
             natif = ((io_dev or {}).get("lanes") or {}).get(lane, {}).get("name") \
                 if io_dev else None
             elements.append(([IPG_ROOT_ID, slot, lane, IDENTITY_BLOCK_ID * 100 + 3], "param",
-                             pref + "Ident_Channel", "",
+                             pref + "Ident_Channel", dpref + "Ident Channel",
                              ("%s · slot %d voie %d" % (natif, slot, lane) if natif
                               else "slot %d · voie %d" % (slot, lane)) if occupied else "",
                              glow.PT_STRING, False))
@@ -655,6 +687,16 @@ def _append_canonical(elements, path_map, contributors, io_state, seen):
             # device expose (valeur + ref → pilotable) ; le reste, et toute voie libre, tombe
             # au défaut.
             for block in prof.get("blocks") or []:
+                # Portée ÉQUIPEMENT (§18) : le bloc décrit le châssis, il est monté UNE fois
+                # sous le slot par `_emit_slot_device`. Sans ce filtre il repartait AUSSI dans
+                # chacune des voies, où RIEN ne peut le remplir — un binding de portée
+                # équipement porte `lane: 0` et va dans `dev_binds`, jamais dans `channels`.
+                # `L01_PTP_State` annonçait donc « NC » et `L01_PTP_Master` du vide, juste à
+                # côté d'un `S01_PTP_Master` exact : deux vérités pour une, sur 1 536 feuilles
+                # (3 × 32 voies × 16 slots). C'est le défaut que le §22 vient de corriger pour
+                # les valeurs, à sa racine cette fois — ces feuilles n'auraient jamais dû exister.
+                if block.get("scope") == "device":
+                    continue
                 bkey, bid = block.get("key"), block.get("id")
                 if not bkey or bid is None:
                     continue
@@ -678,10 +720,12 @@ def _append_canonical(elements, path_map, contributors, io_state, seen):
                     _emit_canon_param(elements, path_map,
                                       [IPG_ROOT_ID, slot, lane, int(bid) * 100 + int(pid)],
                                       res, value, ref, minimum, maximum,
-                                      ident=pref + res["block_ident"] + "_" + res["param_ident"])
+                                      ident=pref + res["block_ident"] + "_" + res["param_ident"],
+                                      desc=_desc_bloc(dpref, res["block_ident"],
+                                                      res["param_label"]))
 
             # Les SDP de la voie, dans la même branche que tout le reste (§17).
-            _emit_lane_sdp(elements, path_map, slot, lane, pref, io_dev)
+            _emit_lane_sdp(elements, path_map, slot, lane, pref, dpref, io_dev)
 
     contributors.append({"type": "ipg", "root": IPG_ROOT_ID,
                          "label": "%s (%d slots × %d voies, %d affectée%s)" % (
@@ -741,6 +785,7 @@ def _emit_slot_device(elements, path_map, slot, prof, index, io_dev, binds, labe
     (bloc×100 + param, donc ≥ 1001) ne peuvent pas entrer en collision avec les numéros de
     voies (1..50), et l'exploitant voit l'état de l'IPG en ouvrant le slot, sans descendre."""
     pref = "S%02d_" % slot
+    dpref = "S%02d " % slot         # côté description, même rappel que pour la voie (§23)
     base = [IPG_ROOT_ID, slot]
     entree = binds or {}
     btype = entree.get("type")          # outil à qui adresser une écriture (cf. `ref`)
@@ -753,14 +798,15 @@ def _emit_slot_device(elements, path_map, slot, prof, index, io_dev, binds, labe
     # ne dirait rien à personne au contrôleur.
     ident_global = str((io_dev or {}).get("device") or "")
     famille = ident_global.split(":")[0] if ":" in ident_global else ""
-    elements.append((base + [IDENTITY_BLOCK_ID * 100], "param", pref + "Ident", "",
+    elements.append((base + [IDENTITY_BLOCK_ID * 100], "param", pref + "Ident", dpref + "Ident",
                      label, glow.PT_STRING, False))
-    elements.append((base + [IDENTITY_BLOCK_ID * 100 + 1], "param", pref + "Ident_Assigned", "",
-                     occupied, glow.PT_BOOLEAN, False))
-    elements.append((base + [IDENTITY_BLOCK_ID * 100 + 2], "param", pref + "Ident_Device", "",
-                     label, glow.PT_STRING, False))
-    elements.append((base + [IDENTITY_BLOCK_ID * 100 + 3], "param", pref + "Ident_Family", "",
-                     famille if occupied else "", glow.PT_STRING, False))
+    elements.append((base + [IDENTITY_BLOCK_ID * 100 + 1], "param", pref + "Ident_Assigned",
+                     dpref + "Ident Assigned", occupied, glow.PT_BOOLEAN, False))
+    elements.append((base + [IDENTITY_BLOCK_ID * 100 + 2], "param", pref + "Ident_Device",
+                     dpref + "Ident Device", label, glow.PT_STRING, False))
+    elements.append((base + [IDENTITY_BLOCK_ID * 100 + 3], "param", pref + "Ident_Family",
+                     dpref + "Ident Family", famille if occupied else "",
+                     glow.PT_STRING, False))
 
     # Catalogue de portée ÉQUIPEMENT. Grille pleine comme partout : un slot vide publie les
     # mêmes feuilles, aux mêmes chemins, avec les valeurs par défaut.
@@ -789,10 +835,12 @@ def _emit_slot_device(elements, path_map, slot, prof, index, io_dev, binds, labe
                 ref = None
             _emit_canon_param(elements, path_map, base + [int(bid) * 100 + int(pid)],
                               res, value, ref, minimum, maximum,
-                              ident=pref + res["block_ident"] + "_" + res["param_ident"])
+                              ident=pref + res["block_ident"] + "_" + res["param_ident"],
+                              desc=_desc_bloc(dpref, res["block_ident"],
+                                              res["param_label"]))
 
 
-def _emit_lane_sdp(elements, path_map, slot, lane, pref, dev):
+def _emit_lane_sdp(elements, path_map, slot, lane, pref, dpref, dev):
     """Les SDP de la voie, À PLAT dans sa branche (§17).
 
     Ils vivaient sous une racine séparée (1100), ce qui obligeait à câbler un même IPG en deux
@@ -809,37 +857,54 @@ def _emit_lane_sdp(elements, path_map, slot, lane, pref, dev):
     for bid, direction in ((SDP_RX_BLOCK_ID, ipg_io.SDP_DIR_RX),
                            (SDP_TX_BLOCK_ID, ipg_io.SDP_DIR_TX)):
         tag = "SdpRx" if direction == ipg_io.SDP_DIR_RX else "SdpTx"
+        sens = tag[3:].upper()          # « RX » / « TX », côté description
         for essence in ipg_io.ESSENCES:
             blk = ipg_io.lane_ip_essence(dev, lane, essence, direction) or {}
             ref = blk.get("ref")
             eid = ipg_io.ESSENCE_ID[essence] * 10
             ident = "%s%s_%s" % (pref, tag, essence.capitalize())
+            # Description COMPLÈTE — « L01 SDP RX Vidéo ». Les feuilles SDP étaient les
+            # seules, avec les identités, à n'en porter aucune : le contrôleur y recopiait
+            # l'identifiant, et c'est ce qui faisait cohabiter deux nommages dans la même
+            # branche (§23). Elles se lisent maintenant comme le reste du catalogue.
+            #
+            # DEUX libellés, et la frontière est le besoin d'exploitation (§23.3).
+            #
+            # Un contrôleur trie sa liste sur la description : « SDP » en tête regroupe ce qui
+            # le porte. Mais il ne va QUE sur les feuilles qui portent effectivement un texte
+            # SDP — huit par voie, quatre essences × deux sens. Les mettre sur les vingt-quatre
+            # feuilles noyait ces huit-là au milieu de leurs propres attributs (« SDP RX Audio 1
+            # Active » se glisse entre « SDP RX ANC » et « SDP RX Audio 2 »), c'est-à-dire
+            # exactement le groupement que l'exploitant demandait, défait par son propre excès.
+            #
+            # `Present`, `Active` et `Format` décrivent le FLUX, pas le SDP : ils restent au
+            # sens (« L01 RX Video Present »). C'est une entorse assumée à la règle « la
+            # description trie comme l'identifiant » — ici c'est VSM qui commande, et ce qu'on
+            # y attrape ensemble, ce sont les huit champs SDP.
+            dlab = "%sSDP %s %s" % (dpref, sens, ipg_io.ESSENCE_LABEL[essence])
+            dattr = "%s%s %s" % (dpref, sens, ipg_io.ESSENCE_LABEL[essence])
             base = [IPG_ROOT_ID, slot, lane]
             w_sdp = ref is not None and direction == ipg_io.SDP_DIR_RX
             p = base + [bid * 100 + eid + _SDP_FIELD_SDP]
-            elements.append((p, "param", ident, "", str(blk.get("sdp") or ""),
+            elements.append((p, "param", ident, dlab, str(blk.get("sdp") or ""),
                              glow.PT_STRING, w_sdp))
             if w_sdp:
                 path_map[tuple(p)] = (dev["type"], ref, "sdp")
             elements.append((base + [bid * 100 + eid + _SDP_FIELD_PRESENT], "param",
-                             ident + "Present", "", bool(blk.get("present")),
+                             ident + "Present", dattr + " Present", bool(blk.get("present")),
                              glow.PT_BOOLEAN, False))
             w_en = ref is not None and blk.get("enabled") is not None
             p = base + [bid * 100 + eid + _SDP_FIELD_ACTIVE]
-            elements.append((p, "param", ident + "Active", "", bool(blk.get("enabled")),
-                             glow.PT_BOOLEAN, bool(w_en)))
+            elements.append((p, "param", ident + "Active", dattr + " Active",
+                             bool(blk.get("enabled")), glow.PT_BOOLEAN, bool(w_en)))
             if w_en:
                 path_map[tuple(p)] = (dev["type"], ref, "enabled")
             # « 48 kHz / 24 bits / 8 ch » (§21). Sur les essences AUDIO seulement : la vidéo a
             # déjà ses formats au catalogue, et l'ANC n'a pas de format à dire — leur ajouter
-            # une feuille vide coûterait 2 048 éléments pour rien. C'est le seul champ SDP à
-            # porter une DESCRIPTION : les autres sont des rouages du routage, celui-ci est là
-            # pour être lu.
+            # une feuille vide coûterait 2 048 éléments pour rien.
             if essence in ipg_io.ESSENCES_AUDIO:
                 elements.append((base + [bid * 100 + eid + _SDP_FIELD_FORMAT], "param",
-                                 ident + "Format",
-                                 "%s %s Format" % (tag[3:].upper(),
-                                                   ipg_io.ESSENCE_LABEL[essence]),
+                                 ident + "Format", dattr + " Format",
                                  ipg_io.audio_sdp_summary(blk.get("sdp")),
                                  glow.PT_STRING, False))
 
@@ -1216,8 +1281,16 @@ def _write_allow_list():
 def _apply_setvalue(path, value):
     if _apply_service_setvalue(path, value):     # paramètres du service, avant tout routage
         return True
-    path_map, _ = _reaggregate()        # tables seules : pas besoin d'encoder l'arbre
-    entry = path_map.get(tuple(path))
+    # Table des chemins DÉJÀ CONNUE, même au-delà de TREE_TTL_S : un chemin inscriptible bouge
+    # rarement, alors que reconstruire l'arbre interroge tous les contributeurs (plusieurs
+    # secondes sur un parc chargé, et une reconstruction dure souvent plus que le TTL). Le
+    # contrôleur attendait donc cette reconstruction à CHAQUE écriture (mesuré le 2026-09-16 :
+    # 7 à 12 s pour un libellé). On ne reconstruit que si le chemin est inconnu du cache.
+    with _tree_lock:
+        entry = (_tree_cache.get("path_map") or {}).get(tuple(path))
+    if not entry:
+        path_map, _ = _reaggregate()    # tables seules : pas besoin d'encoder l'arbre
+        entry = path_map.get(tuple(path))
     if not entry:
         log.info("emberplus: setvalue %s ignoré (inconnu ou lecture seule)", path)
         return False

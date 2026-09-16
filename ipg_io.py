@@ -82,7 +82,11 @@ ESSENCES = (ESSENCE_VIDEO, "audio1", "audio2", "anc")
 ESSENCE_ID = {ESSENCE_VIDEO: 1, "audio1": 2, "audio2": 3, "anc": 4}   # ordre GELÉ : il numérote
                                                                      # les feuilles SDP de la voie
 ESSENCES_AUDIO = ("audio1", "audio2")   # les seules à porter un résumé de format (cf. §21)
-ESSENCE_LABEL = {ESSENCE_VIDEO: "Vidéo", "audio1": "Audio 1", "audio2": "Audio 2", "anc": "ANC"}
+# Libellés des essences. Ils ne servent QU'À l'arbre Ember+ (descriptions des feuilles SDP) —
+# les messages français de `swp08`, `newt` et `cde1922` ont chacun leur propre table. D'où
+# « Video » sans accent : dans une branche de voie il voisine « Present », « Active »,
+# « Format » et « Audio 1 », et il était le seul mot français de la liste (§23.5).
+ESSENCE_LABEL = {ESSENCE_VIDEO: "Video", "audio1": "Audio 1", "audio2": "Audio 2", "anc": "ANC"}
 ESSENCE_TAG = {ESSENCE_VIDEO: "", "audio1": " A1", "audio2": " A2", "anc": " ANC"}
 
 # ─── Bornes d'ÉMISSION (§12.9.4) — le plan réserve plus large que ce qu'on émet ──
