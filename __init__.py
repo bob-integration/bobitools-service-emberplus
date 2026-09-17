@@ -1008,24 +1008,51 @@ def _emit_lane_sdp(elements, path_map, slot, lane, pref, dpref, dev):
 
 _EMPTY_IO = {"devices": {}, "by_slot": {}, "slots": {}, "numbers": {}}
 
-def _io_state(force=False):
-    """État `ember/io` du parc, avec sa péremption propre (IO_TTL_S). Ne lève jamais : un
-    échec de collecte rend le dernier état connu plutôt que de vider les grilles — un
-    contributeur momentanément muet ne doit pas faire disparaître ses crosspoints du contrôleur."""
-    with _tree_lock:
-        state = _tree_cache.get("io")
-        fresh = state is not None and (time.monotonic() - (_tree_cache.get("io_ts") or 0)) < IO_TTL_S
-    if fresh and not force:
-        return state
+_io_refresh = {"en_cours": False}
+
+
+def _io_collect_now():
+    """Collecte `ember/io` et range le résultat. Ne lève jamais."""
     try:
         state = ipg_io.collect()
     except Exception as e:
         log.warning("emberplus: collecte ember/io échouée : %s", e)
-        return state if state is not None else dict(_EMPTY_IO)
+        return None
     with _tree_lock:
         _tree_cache["io"] = state
         _tree_cache["io_ts"] = time.monotonic()
     return state
+
+
+def _io_state(force=False):
+    """État `ember/io` du parc, avec sa péremption propre (IO_TTL_S). Ne lève jamais : un
+    échec de collecte rend le dernier état connu plutôt que de vider les grilles — un
+    contributeur momentanément muet ne doit pas faire disparaître ses crosspoints du contrôleur.
+
+    La collecte est ASYNCHRONE dès qu'on a déjà un état : elle pèse plusieurs secondes (6,1 s
+    mesurées sur un parc de production le 2026-09-17) et elle se faisait dans le fil qui sert le
+    contrôleur. Résultat : trois écritures de tally envoyées à 4 s d'intervalle étaient traitées
+    D'UN BLOC 13 s plus tard. Un état de grille vieux de quelques secondes ne gêne personne ;
+    un tally en retard de 13 s, si. Le premier appel, lui, attend (il n'y a rien à servir)."""
+    with _tree_lock:
+        state = _tree_cache.get("io")
+        fresh = state is not None and (time.monotonic() - (_tree_cache.get("io_ts") or 0)) < IO_TTL_S
+        if not fresh and state is not None and not force and not _io_refresh["en_cours"]:
+            _io_refresh["en_cours"] = True
+            lancer = True
+        else:
+            lancer = False
+    if lancer:
+        def _fond():
+            try:
+                _io_collect_now()
+            finally:
+                with _tree_lock:
+                    _io_refresh["en_cours"] = False
+        threading.Thread(target=_fond, name="emberplus-io", daemon=True).start()
+    if state is not None and (fresh or not force):
+        return state
+    return _io_collect_now() or state or dict(_EMPTY_IO)
 
 
 def _build_tree(seulement=None):
@@ -1159,21 +1186,66 @@ def _children_body(path):
     return glow.build_collection(fils, extra=extras)
 
 
-def _reaggregate(force=False, seulement=None):
-    """Ré-agrège si le cache est expiré ou si `force`. N'ENCODE RIEN : le corps n'est produit
-    qu'à la demande par `_encoded_body()`. Renvoie (path_map, matrix_map)."""
-    with _tree_lock:
-        fresh = (time.monotonic() - _tree_cache["ts"]) < TREE_TTL_S
-        if not force and fresh and _tree_cache.get("elements_list") is not None:
-            return _tree_cache["path_map"], _tree_cache["matrix_map"]
+_agg_refresh = {"en_cours": False}
+
+
+def _ttl_effectif():
+    """Péremption réellement appliquée à l'arbre.
+
+    TREE_TTL_S est un plancher, pas une promesse : sur un parc de production une reconstruction
+    coûte 7,4 s pour un TTL de 5 s (mesuré le 2026-09-17). L'arbre était donc périmé avant
+    d'être fini, le service reconstruisait sans discontinuer, et tout le reste — connexions,
+    poussées, écritures du contrôleur — attendait derrière. On laisse au moins trois fois le
+    coût de la dernière reconstruction entre deux : le parc qui coûte cher est relu plus
+    rarement, celui qui ne coûte rien garde ses 5 s. La fraîcheur ne vient de toute façon pas
+    de ce cycle mais des notifications ciblées (`refresh(seulement=…)`)."""
+    return max(TREE_TTL_S, 3.0 * (_tree_cache.get("cout") or 0.0))
+
+
+def _aggregate_now(seulement=None):
+    """Reconstruit l'arbre et range le résultat. Renvoie (path_map, matrix_map)."""
+    _t0 = time.monotonic()
     elements, path_map, matrix_map, contributors, el_index, io_state = _build_tree(seulement)
     with _tree_lock:
         _tree_cache.update({"ts": time.monotonic(), "body": None, "path_map": path_map,
                             "matrix_map": matrix_map, "contributors": contributors,
-                            "elements": el_index, "elements_list": elements, "io": io_state})
+                            "elements": el_index, "elements_list": elements, "io": io_state,
+                            "cout": time.monotonic() - _t0})
     with _lock:
         _status["contributors"] = contributors
     return path_map, matrix_map
+
+
+def _reaggregate(force=False, seulement=None):
+    """Ré-agrège si le cache est expiré ou si `force`. N'ENCODE RIEN : le corps n'est produit
+    qu'à la demande par `_encoded_body()`. Renvoie (path_map, matrix_map).
+
+    Quand un arbre est déjà en cache, la reconstruction part EN TÂCHE DE FOND et l'appelant
+    reçoit l'arbre connu. Reconstruire coûte 7,3 s sur un parc de production (mesuré le 2026-09-17)
+    et le cache ne vit que TREE_TTL_S : le contrôleur payait donc ces 7 s au hasard de ses
+    requêtes, et les écritures qu'il envoyait pendant ce temps attendaient dans le tampon —
+    tallys compris. Un arbre vieux de quelques secondes est sans conséquence ; un tally en
+    retard de sept secondes ne l'est pas. `force` (recette, diagnostic) attend toujours."""
+    with _tree_lock:
+        fresh = (time.monotonic() - _tree_cache["ts"]) < _ttl_effectif()
+        connu = _tree_cache.get("elements_list") is not None
+        if not force and fresh and connu:
+            return _tree_cache["path_map"], _tree_cache["matrix_map"]
+        differe = connu and not force and not _agg_refresh["en_cours"]
+        if differe:
+            _agg_refresh["en_cours"] = True
+    if connu and not force:
+        if differe:
+            def _fond():
+                try:
+                    _aggregate_now(seulement)
+                finally:
+                    with _tree_lock:
+                        _agg_refresh["en_cours"] = False
+            threading.Thread(target=_fond, name="emberplus-agg", daemon=True).start()
+        with _tree_lock:
+            return _tree_cache["path_map"], _tree_cache["matrix_map"]
+    return _aggregate_now(seulement)
 
 
 def _current_tree(force=False):
@@ -1564,9 +1636,25 @@ def status_dict():
         _status["subscribed"] = len(_subscribed)
         return dict(_status)
 
+# Trame S101 mémorisée. Encadrer 3,5 Mo coûte 3,5 s (mesuré le 2026-09-17) : c'était payé à
+# CHAQUE connexion de client et à CHAQUE poussée vers CHAQUE abonné, alors que la trame est
+# rigoureusement la même pour tous. On la garde tant que le corps est le même OBJET — le corps
+# encodé étant lui-même en cache, la comparaison d'identité suffit et ne coûte rien.
+_wire_cache = {"body": None, "wire": None}
+
+
+def _wire_for(body):
+    w = _wire_cache
+    if w["body"] is body and w["wire"] is not None:
+        return w["wire"]
+    wire = glow.s101_encode_ember(body)
+    _wire_cache["body"], _wire_cache["wire"] = body, wire
+    return wire
+
+
 def _send_frame(sock, body):
     try:
-        wire = glow.s101_encode_ember(body)
+        wire = _wire_for(body)
         if glow.DEBUG:
             log.info("emberplus: → %s %d bytes (%d BER)", sock.getpeername(), len(wire), len(body))
         sock.sendall(wire)
@@ -1724,7 +1812,12 @@ def _handle_client(sock, addr):
     reader = glow.S101Reader()
     sock.settimeout(60.0)
     try:
-        body, _, _ = _current_tree(force=True)     # push initial (valeurs fraîches)
+        # Push initial : l'arbre EN CACHE, jamais une agrégation forcée. Forcer coûtait 12,8 s
+        # (mesuré le 2026-09-17), pendant lesquelles ce client n'était pas servi — et une
+        # écriture qu'il envoyait entre-temps attendait la fin du push. Or le contrôleur se
+        # reconnecte pour un rien : à chaque reconnexion, ses premiers tallys partaient à la
+        # poubelle du temps. Le cache a au plus TREE_TTL_S, et la boucle de poussée suit.
+        body, _, _ = _current_tree()               # push initial (arbre en cache)
         log.info("emberplus: push initial à %s (%d bytes BER)", addr, len(body))
         _send_frame(sock, body)
         while _running:
