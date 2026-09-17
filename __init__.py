@@ -1812,14 +1812,17 @@ def _handle_client(sock, addr):
     reader = glow.S101Reader()
     sock.settimeout(60.0)
     try:
-        # Push initial : l'arbre EN CACHE, jamais une agrégation forcée. Forcer coûtait 12,8 s
-        # (mesuré le 2026-09-17), pendant lesquelles ce client n'était pas servi — et une
-        # écriture qu'il envoyait entre-temps attendait la fin du push. Or le contrôleur se
-        # reconnecte pour un rien : à chaque reconnexion, ses premiers tallys partaient à la
-        # poubelle du temps. Le cache a au plus TREE_TTL_S, et la boucle de poussée suit.
-        body, _, _ = _current_tree()               # push initial (arbre en cache)
-        log.info("emberplus: push initial à %s (%d bytes BER)", addr, len(body))
-        _send_frame(sock, body)
+        # PAS de poussée spontanée à la connexion. Un provider Ember+ annonce sa racine sur
+        # GetDirectory, et le consommateur descend branche par branche (`_children_body`) :
+        # lui jeter l'arbre entier — 3,6 Mo ici — n'est demandé par personne. Ça coûtait
+        # ~5 s pendant lesquelles ce client n'était pas lu, donc ses premières écritures
+        # attendaient : les premiers tallys après chaque reconnexion du contrôleur arrivaient
+        # en retard (mesuré le 2026-09-17). Le réglage rallume l'ancien comportement si un
+        # contrôleur s'avérait en dépendre.
+        if bool(settings.get("emberplus_push_initial")):
+            body, _, _ = _current_tree()
+            log.info("emberplus: push initial à %s (%d bytes BER)", addr, len(body))
+            _send_frame(sock, body)
         while _running:
             try:
                 data = sock.recv(4096)
