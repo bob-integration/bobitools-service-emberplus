@@ -148,6 +148,12 @@ _tree_lock = threading.Lock()
 # pas les structures dérivées : c'est plus petit, et le rechargement repasse par exactement
 # le même code (`_walk_node`) que si le plugin venait de répondre.
 _TREES_FILE = os.path.join(os.path.dirname(config.DB_PATH), "emberplus_trees.json")
+# Qui a signalé un changement depuis la dernière diffusion (§26). Un seul contributeur
+# distinct ⇒ relecture CIBLÉE ; plusieurs, ou un inconnu, ⇒ reconstruction complète.
+_notify_qui = set()
+
+_raw_bindings = {}             # {type: réponse ember/bindings}, jumeau de `_raw_trees` : sert
+                               # à ne PAS réinterroger un contributeur qui n'a rien signalé
 _raw_trees = {}                # {type: réponse ember/tree}, miroir mémoire du fichier
 _raw_trees_dirty = False
 
@@ -481,6 +487,19 @@ def _desc_bloc(dpref, bloc_ident, libelle):
     return "%s%s %s" % (dpref, bloc, nu)
 
 
+# Feuilles SDP RX annoncées inscriptibles alors qu'AUCUNE route ne leur correspond (§24) :
+# { chemin : motif }. Même durée de vie que `path_map` et `_enum_nc`, reconstruit avec l'arbre.
+# Sert à refuser l'écriture EN DISANT POURQUOI, au lieu du « inconnu ou lecture seule » générique.
+_sdp_rx_noref = {}
+
+# Texte SDP tel que le CONTRÔLEUR l'a écrit, par chemin de feuille (§25). Ce n'est PAS un
+# cache de valeur : c'est la demande, gardée pour pouvoir la republier une fois — et seulement
+# une fois — que le matériel a confirmé être abonné au MÊME flux. Durée de vie plus longue que
+# `path_map` : une demande survit aux reconstructions d'arbre, elle n'est effacée que par une
+# écriture suivante sur la même feuille. Bornée par construction (une entrée par feuille SDP RX).
+_sdp_written = {}
+
+
 def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maximum, ident=None,
                       desc=None):
     """Émet un paramètre canonique (forme positionnelle enum/bornes de `_encode_element`) et,
@@ -526,7 +545,7 @@ def _emit_canon_param(elements, path_map, ppath, res, value, ref, minimum, maxim
             _enum_nc[tuple(ppath)] = _enum_unknown(res)
 
 
-def _append_canonical(elements, path_map, contributors, io_state, seen):
+def _append_canonical(elements, path_map, contributors, io_state, seen, seulement=None):
     """Voie CANONIQUE (« moule IPG »), modèle VIVIER. La racine 1000 porte un nombre FIXE de
     voies (grille pleine, `_num_lanes`), chacune émettant TOUT le catalogue du profil — qu'un
     device y soit affecté ou non. Ainsi VSM peut être configuré avant qu'un équipement soit
@@ -577,10 +596,19 @@ def _append_canonical(elements, path_map, contributors, io_state, seen):
     dev_binds = {}       # slot -> { canon_key: binding } de portée ÉQUIPEMENT (§18)
     dev_labels = {}      # slot -> label lisible du device
     for type_ in _bindings_types():
-        status, data = tools.call(type_, "ember/bindings", "GET", actor=EMBER_ACTOR,
-                                  timeout=TREE_CALL_TIMEOUT_S)
-        if status != 200 or not isinstance(data, dict):
-            continue
+        # Relecture CIBLÉE (§26) : si un seul contributeur a signalé et que ce n'est pas
+        # celui-ci, on rejoue son dernier état connu au lieu de l'interroger. Le diff décide
+        # toujours de ce qui part sur le fil — on ne saute que l'INTERROGATION, jamais la
+        # comparaison. Et la reconstruction périodique (TREE_TTL_S) rattrape tout ce qu'une
+        # notification manquée aurait laissé filer.
+        if seulement and type_ != seulement and _raw_bindings.get(type_) is not None:
+            data = _raw_bindings[type_]
+        else:
+            status, data = tools.call(type_, "ember/bindings", "GET", actor=EMBER_ACTOR,
+                                      timeout=TREE_CALL_TIMEOUT_S)
+            if status != 200 or not isinstance(data, dict):
+                continue
+            _raw_bindings[type_] = data
         for dev in data.get("devices") or []:
             device = dev.get("device")
             if device in (None, ""):
@@ -840,6 +868,56 @@ def _emit_slot_device(elements, path_map, slot, prof, index, io_dev, binds, labe
                                               res["param_label"]))
 
 
+def _sdp_publie(ppath, blk):
+    """Texte publié pour une feuille SDP de RÉCEPTION (§25).
+
+    Le contrôleur tient une écriture pour confirmée quand le provider lui rend SA valeur. Or un
+    récepteur ne restitue jamais le SDP qu'on lui a donné : le SNP fabrique son propre transport
+    file IS-05 — `o=`, `s=`, `i=` réécrits, `a=recvonly` ajouté, TTL du `c=` ramenée à 32,
+    paramètres `fmtp` réordonnés, `b=AS:` perdu. Mesuré le 2026-09-17 : 505 octets écrits,
+    493 republiés, pour le MÊME abonnement. La comparaison ne pouvait donc jamais réussir, et le
+    contrôleur réécrivait la même valeur toutes les dix à vingt secondes, indéfiniment.
+
+    On republie donc le texte demandé — mais JAMAIS sur la foi de l'écriture. Trois conditions,
+    toutes rendues par le MATÉRIEL, et toutes exigées :
+
+      · `present` : le récepteur porte un transport file, donc un abonnement existe ;
+      · `enabled` : le matériel déclare cet abonnement ACTIF (`subscription.active`) ;
+      · même flux : média, groupe, port et source concordent (`ipg_io.sdp_flow_id`).
+
+    Faute d'une seule, on publie ce que dit le matériel. C'est la règle du §5 tenue à l'endroit
+    où elle compte : on n'accuse pas réception d'une commutation qu'on n'a pas constatée — un
+    accusé optimiste serait exactement le « faux bouton » du §24.1, transposé à la lecture.
+
+    La demande n'est pas oubliée en cas de désaccord : le matériel peut n'avoir pas encore
+    rafraîchi son état. Elle est remplacée à l'écriture suivante sur la même feuille."""
+    brut = str(blk.get("sdp") or "")
+    voulu = _sdp_written.get(tuple(ppath))
+    if voulu is None:
+        return brut
+    # Le refus d'écho se DIT, une fois par motif et par feuille : sans ça, « le contrôleur
+    # réécrit toujours » ne se distingue pas de « on n'a jamais mémorisé sa demande ».
+    if not (blk.get("present") and blk.get("enabled")):
+        _echo_refus(ppath, "le matériel ne déclare pas l'abonnement actif "
+                           "(present=%r, enabled=%r)" % (blk.get("present"), blk.get("enabled")))
+        return brut
+    ida, idb = ipg_io.sdp_flow_id(voulu), ipg_io.sdp_flow_id(brut)
+    if ida is None or idb is None or ida != idb:
+        _echo_refus(ppath, "le matériel désigne %r, le contrôleur avait demandé %r" % (idb, ida))
+        return brut
+    return voulu
+
+
+_echo_dit = {}          # chemin -> dernier motif journalisé, pour ne pas répéter à chaque poussée
+
+
+def _echo_refus(ppath, motif):
+    cle = tuple(ppath)
+    if _echo_dit.get(cle) != motif:
+        _echo_dit[cle] = motif
+        log.info("emberplus: SDP RX %s republié DU MATÉRIEL — %s (§25)", list(ppath), motif)
+
+
 def _emit_lane_sdp(elements, path_map, slot, lane, pref, dpref, dev):
     """Les SDP de la voie, À PLAT dans sa branche (§17).
 
@@ -884,12 +962,31 @@ def _emit_lane_sdp(elements, path_map, slot, lane, pref, dpref, dev):
             dlab = "%sSDP %s %s" % (dpref, sens, ipg_io.ESSENCE_LABEL[essence])
             dattr = "%s%s %s" % (dpref, sens, ipg_io.ESSENCE_LABEL[essence])
             base = [IPG_ROOT_ID, slot, lane]
-            w_sdp = ref is not None and direction == ipg_io.SDP_DIR_RX
+            # TOUJOURS inscriptible en réception (§24), qu'une route existe ou non.
+            #
+            # Le drapeau valait `ref is not None`, donc il suivait une valeur LIVE — la
+            # corrélation d'un flux NMOS au récepteur. Deux conséquences, et la seconde est
+            # rédhibitoire. D'abord la forme de l'arbre se mettait à dépendre d'une mesure,
+            # ce que le §5 interdit, et un contrôleur qui MÉMORISE garde la feuille grise
+            # même après le retour du flux. Ensuite et surtout : au contrôleur, on ne peut
+            # pas déposer un SDP sur un paramètre en lecture seule. Le drapeau n'était donc
+            # pas un affichage, il INTERDISAIT l'acte de routage — et interdisait du même
+            # coup d'armer un abonnement d'avance, qui est précisément l'usage.
+            #
+            # ⚠ C'est l'inverse de la règle des « faux boutons » de `_emit_canon_param`, et
+            # l'inversion est assumée : là-bas le paramètre reste lisible et le faux bouton
+            # n'apporte rien ; ici le drapeau EST le seul accès à la feuille. Mieux vaut un
+            # levier qui refuse en disant pourquoi qu'un levier absent. Le refus est rendu à
+            # `_apply_setvalue` par `_sdp_rx_noref`.
+            w_sdp = direction == ipg_io.SDP_DIR_RX
             p = base + [bid * 100 + eid + _SDP_FIELD_SDP]
-            elements.append((p, "param", ident, dlab, str(blk.get("sdp") or ""),
-                             glow.PT_STRING, w_sdp))
-            if w_sdp:
+            valeur = _sdp_publie(p, blk) if w_sdp else str(blk.get("sdp") or "")
+            elements.append((p, "param", ident, dlab, valeur, glow.PT_STRING, w_sdp))
+            if w_sdp and ref is not None:
                 path_map[tuple(p)] = (dev["type"], ref, "sdp")
+            elif w_sdp:
+                _sdp_rx_noref[tuple(p)] = ("aucun matériel sur ce slot" if dev is None else
+                                           "aucun récepteur NMOS corrélé à cette voie")
             elements.append((base + [bid * 100 + eid + _SDP_FIELD_PRESENT], "param",
                              ident + "Present", dattr + " Present", bool(blk.get("present")),
                              glow.PT_BOOLEAN, False))
@@ -931,7 +1028,7 @@ def _io_state(force=False):
     return state
 
 
-def _build_tree():
+def _build_tree(seulement=None):
     """Agrège les sous-arbres : (body racine, path_map, matrix_map, contributors).
     Deux voies coexistent : mode LIBRE (ember/tree, monté par plugin) + mode CANONIQUE
     (ember/bindings, monté par slot sous la racine IPG). Le body racine contient
@@ -942,12 +1039,19 @@ def _build_tree():
     matrix_map = {}
     contributors = []
     _enum_nc.clear()    # garde-fou d'écriture des enums (§22) : même durée de vie que path_map
+    _sdp_rx_noref.clear()   # idem, pour le refus motivé d'un SDP RX sans récepteur (§24)
     seen = set()        # nœuds déjà montés, PARTAGÉ : le nœud de service crée la racine du
                         # moule quand la couche IPG est muette, et ne la duplique pas sinon
     global _raw_trees_dirty
     for idx, type_ in _ember_roots():
-        status, data = tools.call(type_, "ember/tree", "GET", actor=EMBER_ACTOR,
-                                  timeout=TREE_CALL_TIMEOUT_S)
+        # Même règle qu'aux bindings (§26) : un contributeur qui n'a rien signalé n'est pas
+        # réinterrogé, son dernier sous-arbre connu est rejoué. C'est EXACTEMENT ce que fait
+        # déjà le repli d'un contributeur muet, juste en dessous — on s'en sert à froid.
+        if seulement and type_ != seulement and isinstance(_raw_trees.get(type_), dict):
+            status, data = 200, _raw_trees[type_]
+        else:
+            status, data = tools.call(type_, "ember/tree", "GET", actor=EMBER_ACTOR,
+                                      timeout=TREE_CALL_TIMEOUT_S)
         stale = False
         if not (status == 200 and isinstance(data, dict)):
             # Un contributeur muet, lent ou cassé ne doit PAS faire DISPARAÎTRE son sous-arbre
@@ -988,7 +1092,7 @@ def _build_tree():
     # avec sa propre péremption (cf. IO_TTL_S) — c'est de loin le contributeur le plus lourd.
     io_state = _io_state()
     try:
-        _append_canonical(elements, path_map, contributors, io_state, seen)
+        _append_canonical(elements, path_map, contributors, io_state, seen, seulement)
     except Exception as e:
         log.warning("emberplus: agrégation canonique (IPG) échouée : %s", e)
     # ⚠ Les GRILLES DE FLUX Ember+ ont été retirées le 2026-07-31 : le routage des signaux et
@@ -1055,14 +1159,14 @@ def _children_body(path):
     return glow.build_collection(fils, extra=extras)
 
 
-def _reaggregate(force=False):
+def _reaggregate(force=False, seulement=None):
     """Ré-agrège si le cache est expiré ou si `force`. N'ENCODE RIEN : le corps n'est produit
     qu'à la demande par `_encoded_body()`. Renvoie (path_map, matrix_map)."""
     with _tree_lock:
         fresh = (time.monotonic() - _tree_cache["ts"]) < TREE_TTL_S
         if not force and fresh and _tree_cache.get("elements_list") is not None:
             return _tree_cache["path_map"], _tree_cache["matrix_map"]
-    elements, path_map, matrix_map, contributors, el_index, io_state = _build_tree()
+    elements, path_map, matrix_map, contributors, el_index, io_state = _build_tree(seulement)
     with _tree_lock:
         _tree_cache.update({"ts": time.monotonic(), "body": None, "path_map": path_map,
                             "matrix_map": matrix_map, "contributors": contributors,
@@ -1082,8 +1186,49 @@ def _invalidate():
     with _tree_lock:
         _tree_cache["ts"] = 0.0
 
-def refresh():
-    """Force la ré-agrégation et re-pousse aux abonnés (à appeler après un changement)."""
+def _cible_notify(qui):
+    """Contributeur à relire pour une notification venue de `qui`, ou None pour tout relire.
+
+    Deux cas, et le second est celui qui compte en exploitation :
+
+      · `qui` EST un contributeur — une racine du mode libre, ou la couche IPG : on le relit
+        lui, et c'est direct ;
+      · `qui` est une FAMILLE de matériel (snp, newt, cde1922, neuron). Elle ne contribue pas
+        à l'arbre directement : elle alimente la couche IPG, qui l'agrège (§12.11). C'est
+        pourtant elle qui notifie — le SNP le fait en quelques millisecondes sur son WebSocket
+        (§16), et c'est de loin la notification la plus fréquente. Sans cette traduction, la
+        relecture ciblée du §26 ne servait justement PAS le cas le plus fréquent.
+
+    La liste des familles n'est PAS codée en dur et ne coûte aucun appel : l'état `ember/io`
+    déjà en cache porte le type de chaque matériel du parc. Une famille absente du parc n'est
+    pas reconnue — et retombe donc sur la reconstruction complète, ce qui est le bon défaut."""
+    if not qui or qui == "?":
+        return None
+    if qui in {t for _i, t in _ember_roots()} or qui in _bindings_types():
+        return qui
+    with _tree_lock:
+        io_state = _tree_cache.get("io") or {}
+    # ⚠ PAS le champ `type` : depuis le §12.11 il vaut `ipg_generique` pour TOUT le parc —
+    # c'est le contributeur, pas la famille. La famille est le préfixe de l'identifiant GLOBAL
+    # (« snp:2811962d1076 »), le même que celui publié en `S01_Ident_Family`.
+    familles = {str((d or {}).get("device") or "").split(":")[0]
+                for d in (io_state.get("devices") or {}).values()}
+    familles.discard("")
+    if qui in familles:
+        # La couche IPG est le contributeur qui porte cette famille dans l'arbre.
+        return next(iter(_bindings_types()), None)
+    return None
+
+
+def refresh(seulement=None):
+    """Force la ré-agrégation et re-pousse aux abonnés (à appeler après un changement).
+
+    `seulement` = type du contributeur qui a signalé, quand on le sait (§26) : les autres ne
+    sont pas réinterrogés, leur dernier état connu est rejoué. C'est une OPTIMISATION, jamais
+    une source de vérité — la reconstruction périodique repasse sur tout le monde."""
+    if seulement:
+        with _lock:
+            _notify_qui.add(seulement)
     _invalidate()
     notify_change()
 
@@ -1292,6 +1437,15 @@ def _apply_setvalue(path, value):
         path_map, _ = _reaggregate()    # tables seules : pas besoin d'encoder l'arbre
         entry = path_map.get(tuple(path))
     if not entry:
+        # Un SDP RX est annoncé inscriptible même sans route (§24) : on doit donc dire ce qui
+        # manque, sinon la seule trace d'un routage refusé serait « inconnu ou lecture seule »
+        # — le message de la faute de frappe, sur l'action la plus courante du contrôleur.
+        motif = _sdp_rx_noref.get(tuple(path))
+        if motif:
+            log.warning("emberplus: SDP RX %s NON appliqué — %s. La feuille est inscriptible "
+                        "pour que le contrôleur puisse l'atteindre, mais il n'y a pas de "
+                        "récepteur où écrire.", path, motif)
+            return False
         log.info("emberplus: setvalue %s ignoré (inconnu ou lecture seule)", path)
         return False
     # `NC` est notre mot pour « ce matériel ne le dit pas » (§22), pas une valeur du device.
@@ -1322,7 +1476,21 @@ def _apply_setvalue(path, value):
         detail = json.dumps(payload, ensure_ascii=False)[:400]
         audit_log(type_, "ember/set", detail, user_id=None, username=EMBER_ACTOR)
         log.info("emberplus: set %s %s = %r", type_, ref, value)
-        refresh()
+        # Un SDP de réception déposé par le contrôleur est GARDÉ (§25) : le matériel ne
+        # restitue pas ce texte-là, il publie le sien. On le republiera à sa place, mais
+        # seulement quand le matériel aura dit être abonné au même flux.
+        if field == "sdp":
+            _sdp_written[tuple(path)] = value
+            # Confirmation IMMÉDIATE, avant toute ré-agrégation : c'est la seule façon de
+            # tenir les 3 s du « Parameter Timeout » de VSM (§25.5).
+            immediat = _broadcast_param(path, value)
+            log.info("emberplus: SDP RX %s mémorisé et republié %s (§25)", list(path),
+                     "IMMÉDIATEMENT" if immediat else "au prochain cycle (feuille inconnue)")
+        # On sait à QUI on vient d'écrire : la ré-agrégation qui suit n'a aucune raison de
+        # réinterroger les autres contributeurs (§26). Sous un flux de commutations, c'est la
+        # différence entre relire le parc entier à chaque crosspoint et ne relire que l'outil
+        # concerné.
+        refresh(seulement=type_)
         return True
     log.warning("emberplus: set %s %s → %s %s", type_, ref, status, data)
     return False
@@ -1445,7 +1613,14 @@ def _broadcast_update():
         # premier passage — donc un arbre complet à chaque fois.
         primed = _tree_cache.get("elements_list") is not None
     try:
-        _, matrix_map = _reaggregate(force=True)        # ré-agrège SANS encoder
+        # Qui a signalé depuis la dernière diffusion ? UN SEUL contributeur connu ⇒ on ne
+        # réinterroge que lui (§26). Plusieurs, ou un « ? », ⇒ tout, comme avant. On ne devine
+        # jamais : dans le doute c'est la reconstruction complète, qui reste la référence.
+        with _lock:
+            qui = set(_notify_qui)
+            _notify_qui.clear()
+        seulement = next(iter(qui)) if len(qui) == 1 else None
+        _, matrix_map = _reaggregate(force=True, seulement=seulement)   # ré-agrège SANS encoder
     except Exception as e:
         log.error("emberplus: build arbre échoué : %s", e)
         return
@@ -1468,6 +1643,51 @@ def _broadcast_update():
     global _last_push_ts
     _last_push_ts = time.time()
     _send_frames(frames)
+
+def _broadcast_param(path, valeur):
+    """Repousse IMMÉDIATEMENT une seule feuille, avec sa nouvelle valeur (§25.5).
+
+    MESURÉ dans le journal de VSM le 2026-09-17 : il arme un « Parameter Timeout » de 3,0 s
+    sur le paramètre qu'il vient d'écrire, et réécrit s'il ne lui revient pas —
+
+        16:42:20.508  écriture de « L24 SDP RX Video »
+        16:42:23.508  {Parameter: L24 SDP RX Video} Parameter Timeout
+        §§§§ retry: "IPG_3 In_74 Video" << "C100 Head 10"
+
+    Or une ré-agrégation complète coûte 1,7 à 2,7 s (mesuré le même jour), plus 3,4 Mo à
+    transmettre. On passait donc parfois sous les 3 s, souvent non : d'où une confirmation
+    intermittente et une boucle de réécriture que rien n'arrêtait. Le débit n'était pas en
+    cause, le CHEMIN l'était — on faisait reconstruire tout l'arbre pour une feuille.
+
+    Même geste que `_broadcast_matrix` pour un crosspoint : la collection Ember+ est plate et
+    à chemins absolus, un seul élément EST une trame de mise à jour valide.
+
+    ⚠ Ce n'est PAS un accusé optimiste. Depuis `snp` 0.42.0 le plugin relit le récepteur et
+    compare le groupe réellement actif avant de rendre `ok` : quand on arrive ici, le matériel
+    a déjà confirmé. La règle du §25.3 tient donc toujours — on ne republie que constaté.
+
+    L'index est mis à jour du même coup, sans quoi la diffusion incrémentale suivante
+    repousserait cet élément comme s'il venait de changer."""
+    cle = tuple(path)
+    with _tree_lock:
+        el = (_tree_cache.get("elements") or {}).get(cle)
+    if not el or el[1] != "param":
+        return False
+    neuf = tuple(el[:4]) + (valeur,) + tuple(el[5:])
+    with _tree_lock:
+        idx = _tree_cache.get("elements")
+        if idx is not None:
+            idx[cle] = neuf
+        lst = _tree_cache.get("elements_list")
+        if lst is not None:
+            for i, e in enumerate(lst):
+                if tuple(e[0]) == cle:
+                    lst[i] = neuf
+                    break
+        _tree_cache["body"] = None          # le corps mémoïsé porte l'ancienne valeur
+    _send_frames([glow.build_collection([neuf])])
+    return True
+
 
 def _broadcast_matrix(mpath, m):
     """Envoie IMMÉDIATEMENT (sans débounce) la frame d'UNE matrice aux abonnés — fait remonter
@@ -1743,8 +1963,15 @@ def register_routes(bp):
             return jsonify({"ok": True, "ignored": "service arrêté"})
         # En FOND : la ré-agrégation prend ~0,6 s et l'appelant n'a aucune raison de l'attendre.
         # Il vient de recevoir une notification de son matériel, il a mieux à faire que patienter.
-        threading.Thread(target=refresh, daemon=True).start()
-        log.info("emberplus: %s signale un changement → ré-agrégation", qui)
+        # `qui` était reçu puis JETÉ : on déclenchait une reconstruction complète alors que
+        # l'appelant avait dit d'où venait le changement. On ne lui demande toujours pas CE qui
+        # a changé — ce serait la seconde vérité que refuse le §12.11 — seulement d'où, ce
+        # qu'il est seul à savoir. Le diff continue de décider ce qui part sur le fil.
+        cible = _cible_notify(qui)
+        threading.Thread(target=refresh, kwargs={"seulement": cible},
+                         daemon=True).start()
+        log.info("emberplus: %s signale un changement → ré-agrégation %s", qui,
+                 ("ciblée sur %s" % cible) if cible else "complète (contributeur non reconnu)")
         return jsonify({"ok": True})
 
     @bp.route("/api/emberplus/status", methods=["GET"])

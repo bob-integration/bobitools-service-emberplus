@@ -534,6 +534,41 @@ _RTPMAP_RE = re.compile(r"^a=rtpmap:\s*\d+\s+([^/\s]+)/(\d+)(?:/(\d+))?", re.I |
 _PCM_RE = re.compile(r"^L(\d+)$", re.I)
 
 
+# Identité d'un FLUX, par opposition au texte qui l'enrobe (§25). Un récepteur ne restitue pas
+# le SDP qu'on lui a donné : il publie le sien, re-sérialisé (`o=`, `s=`, `i=`, l'ordre des
+# paramètres `fmtp`, la TTL du `c=`, `a=recvonly`…). Comparer les textes ne dit donc RIEN ;
+# comparer média + groupe + port + source dit si c'est le même abonnement.
+_C_ADDR_RE = re.compile(r"^c=IN IP4\s+([0-9.]+)", re.I | re.M)
+_M_LINE_RE = re.compile(r"^m=([a-z]+)\s+(\d+)", re.I | re.M)
+_SRCFILT_RE = re.compile(r"^a=source-filter:\s*incl\s+IN\s+IP4\s+\S+\s+([0-9.]+)", re.I | re.M)
+
+
+def sdp_flow_id(sdp):
+    """(média, groupe, port, source) du PREMIER flux d'un SDP, ou None s'il est illisible.
+
+    On ne lit que la PREMIÈRE section média : un flux redondant ST 2022-7 en porte deux, et la
+    seconde est la patte de secours — elle vaut `0.0.0.0` chez certaines familles, ce qui ferait
+    diverger deux descriptions du même abonnement.
+
+    `source` peut manquer (tous les SDP ne portent pas de `source-filter`) ; il vaut alors None
+    des deux côtés et ne départage rien, ce qui est le comportement voulu — on ne refuse pas une
+    concordance parce qu'une information est absente PARTOUT."""
+    texte = str(sdp or "")
+    m = _M_LINE_RE.search(texte)
+    if not m:
+        return None
+    media, port = m.group(1).lower(), m.group(2)
+    c = _C_ADDR_RE.search(texte)
+    if not c:
+        return None
+    src = _SRCFILT_RE.search(texte)
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return None
+    return (media, c.group(1), port, src.group(1) if src else None)
+
+
 def audio_sdp_summary(sdp):
     """« 48 kHz / 24 bits / 8 ch » depuis le SDP d'un signal audio, ou `""` (§21).
 
