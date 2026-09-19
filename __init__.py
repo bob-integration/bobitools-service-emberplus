@@ -978,7 +978,16 @@ def _emit_lane_sdp(elements, path_map, slot, lane, pref, dpref, dev):
             # n'apporte rien ; ici le drapeau EST le seul accès à la feuille. Mieux vaut un
             # levier qui refuse en disant pourquoi qu'un levier absent. Le refus est rendu à
             # `_apply_setvalue` par `_sdp_rx_noref`.
-            w_sdp = direction == ipg_io.SDP_DIR_RX
+            #
+            # SEULE exception : le contributeur DÉCLARE la feuille non inscriptible
+            # (`writable: false`, cf. `ipg_io._essence_block`). Ce n'est pas le drapeau live
+            # d'autrefois — c'est une configuration, stable, que l'exploitant coche. Elle
+            # sert aux matériels qui ne RENDENT PAS le SDP qu'on leur donne : le contrôleur
+            # lit alors autre chose que ce qu'il a écrit, conclut à l'échec et recommence
+            # sans fin. Mesuré le 2026-09-19 sur l'ANC du Neuron : 1 366 tentatives en une
+            # demi-heure sur une seule entrée. Mieux vaut une feuille grise qu'une boucle.
+            w_sdp = (direction == ipg_io.SDP_DIR_RX
+                     and blk.get("writable") is not False)
             p = base + [bid * 100 + eid + _SDP_FIELD_SDP]
             valeur = _sdp_publie(p, blk) if w_sdp else str(blk.get("sdp") or "")
             elements.append((p, "param", ident, dlab, valeur, glow.PT_STRING, w_sdp))

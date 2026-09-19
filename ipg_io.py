@@ -224,8 +224,13 @@ def _split_essence(spec, num):
 # ═════════════════════════════════════════════════════════════════════
 
 def _essence_block(d):
+    # `writable` : un contributeur peut DÉCLARER qu'une réception n'accepte pas qu'on lui
+    # écrive un SDP. Absent = inscriptible, c'est-à-dire le comportement du §24 et de tout
+    # plugin qui ignore la clé. C'est une CONFIGURATION du matériel, pas une mesure de son
+    # état : la forme de l'arbre ne se met donc pas à dépendre d'une valeur live (§5).
     return {"sdp": d.get("sdp"), "present": d.get("present"),
-            "enabled": d.get("enabled"), "ref": d.get("ref")}
+            "enabled": d.get("enabled"), "ref": d.get("ref"),
+            "writable": d.get("writable")}
 
 
 def _norm_essences(d, builder):
