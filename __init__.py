@@ -1556,7 +1556,11 @@ def _apply_setvalue(path, value):
     if ok:
         detail = json.dumps(payload, ensure_ascii=False)[:400]
         audit_log(type_, "ember/set", detail, user_id=None, username=EMBER_ACTOR)
-        log.info("emberplus: set %s %s = %r", type_, ref, value)
+        # Au niveau INFO, seuls les SDP (un abonnement : rare, et précieux pour diagnostiquer le
+        # contrôleur). Une écriture d'état — tally, libellé — en produit des milliers par jour en
+        # production (mesuré le 2026-09-19 : 30 par seconde sans broncher) : elle passe en DEBUG.
+        est_sdp = field == "sdp" or (isinstance(value, str) and value.startswith("v=0"))
+        (log.info if est_sdp else log.debug)("emberplus: set %s %s = %r", type_, ref, value)
         # Un SDP de réception déposé par le contrôleur est GARDÉ (§25) : le matériel ne
         # restitue pas ce texte-là, il publie le sien. On le republiera à sa place, mais
         # seulement quand le matériel aura dit être abonné au même flux.
