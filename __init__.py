@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import socket
+import tempfile
 import threading
 import time
 
@@ -186,13 +187,27 @@ def _save_raw_trees():
     global _raw_trees_dirty
     if not _raw_trees_dirty:
         return
-    tmp = _TREES_FILE + ".tmp"
+    # Temporaire PROPRE à cette écriture, dans le même répertoire (le renommage reste donc
+    # atomique). Un nom fixe est partagé par toutes les écritures simultanées : la première à
+    # renommer fait disparaître le temporaire de la seconde, qui échoue sur « No such file or
+    # directory ». Ce writer n'est appelé que depuis l'agrégation, mais le défaut y était
+    # latent — il s'est manifesté chez son jumeau (ipg_generique) le 2026-09-19.
+    d = os.path.dirname(_TREES_FILE) or "."
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(_TREES_FILE) + ".", suffix=".tmp")
+    except Exception as e:
+        log.warning("emberplus: écriture de %s échouée : %s", _TREES_FILE, e)
+        return
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(_raw_trees, f, ensure_ascii=False)
         os.replace(tmp, _TREES_FILE)
         _raw_trees_dirty = False
     except Exception as e:
+        try:
+            os.unlink(tmp)              # pas de temporaire abandonné à côté du fichier
+        except OSError:
+            pass
         log.warning("emberplus: écriture de %s échouée : %s", _TREES_FILE, e)
 
 
