@@ -33,6 +33,10 @@
       "type": "bool",
       "default": true
     },
+    "emberplus_eager_paths": {
+      "type": "text",
+      "default": ""
+    },
     "emberplus_notify_token": {
       "type": "text",
       "default": ""

@@ -1187,6 +1187,43 @@ def _encoded_body():
         _tree_cache["body"] = body
     return body
 
+def _eager_paths():
+    """Chemins dont un GetDirectory rend le SOUS-ARBRE ENTIER, et non les seuls enfants directs.
+
+    Réglage `emberplus_eager_paths`, une liste de chemins séparés par des virgules ou des
+    espaces (« 5.2 », « 5.2, 3.1 »). VIDE PAR DÉFAUT : sans réglage, rien ne change.
+
+    ── Pourquoi ce réglage existe (2026-09-23) ─────────────────────────────────────────
+    VSM se lie à l'IDENTIFIANT, pas au numéro : tant qu'il n'a pas parcouru un nœud, il n'a
+    aucun numéro de paramètre à écrire et il envoie `-1`. Le provider rejette alors —
+    « inconnu ou lecture seule » — et le tally n'arrive jamais. Mesuré : 104 écritures de
+    tally vers le multiviewer C100 entre le 16 et le 19 septembre, TOUTES en `[5, 2, n, -1]`,
+    toutes rejetées, sans que rien ne fasse de bruit. L'exploitant devait ouvrir la branche
+    dans VSM pour que le tally passe — et ouvrir un objet de monitoring faisait retomber le
+    précédent, donc un seul à la fois, ce qui n'est pas tenable pour un multiviewer.
+
+    Le remède global existait déjà (`emberplus_lazy_dir` à faux, l'arbre entier à chaque
+    GetDirectory) mais il est hors de prix : la branche IPG porte ~21 600 éléments là où les
+    objets de monitoring du C100 en portent 421 — un facteur cinquante. On paierait l'IPG
+    pour régler un problème de multiviewer, et on réveillerait ce que le §26 a éteint.
+
+    D'où le grain FIN : on empresse un chemin, pas un arbre.
+
+    Un chemin empressé est servi dès qu'on répond à l'un de ses ANCÊTRES — racine comprise.
+    VSM reçoit donc les 42 objets et leurs paramètres à sa première descente, sans que
+    personne ait à ouvrir quoi que ce soit."""
+    brut = str(settings.get("emberplus_eager_paths") or "")
+    out = []
+    for morceau in brut.replace(",", " ").split():
+        try:
+            chemin = tuple(int(x) for x in morceau.split(".") if x != "")
+        except ValueError:
+            continue                      # un chemin illisible est ignoré, jamais deviné
+        if chemin:
+            out.append(chemin)
+    return out
+
+
 def _children_body(path):
     """Corps d'un GetDirectory sur UN nœud : ses enfants DIRECTS, et rien d'autre.
 
@@ -1207,6 +1244,20 @@ def _children_body(path):
     # connexions ne partent qu'au GetDirectory qui les vise, sinon le contrôleur se déconnecte.
     extras = [_encode_matrix(p, m, with_axes=False) for p, m in matrix_map.items()
               if len(p) == n + 1 and list(p[:n]) == list(path)]
+    # Sous-arbres EMPRESSÉS (cf. `_eager_paths`) : tout ce qui est sous un chemin déclaré,
+    # dès qu'on répond à l'un de ses ancêtres. Dédoublonné par chemin — un enfant direct peut
+    # déjà figurer dans `fils` quand le chemin empressé est celui qu'on sert.
+    vus = {tuple(e[0]) for e in fils}
+    for eag in _eager_paths():
+        ne = len(eag)
+        if ne < n or tuple(eag[:n]) != tuple(path):
+            continue                      # ce chemin n'est pas sous celui qu'on sert
+        for e in elements:
+            if len(e[0]) > ne and tuple(e[0][:ne]) == eag and tuple(e[0]) not in vus:
+                vus.add(tuple(e[0]))
+                fils.append(e)
+        extras += [_encode_matrix(p, m, with_axes=False) for p, m in matrix_map.items()
+                   if len(p) > ne and tuple(p[:ne]) == eag]
     return glow.build_collection(fils, extra=extras)
 
 
