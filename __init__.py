@@ -121,6 +121,9 @@ _MATRIX_TYPE = {
 _lock = threading.Lock()
 _clients = set()               # connexions actives
 _subscribed = set()            # sockets ayant souscrit au broadcast
+# Écritures refusées parce que le CONTRÔLEUR n'avait pas résolu le chemin (numéro négatif).
+# Compté et exposé dans l'état du service : ce défaut-là ne fait aucun bruit tout seul.
+_rejets_non_resolus = {"total": 0, "dernier": None}
 _server_thread = None
 _push_thread = None            # pousseur périodique (cf. _push_loop)
 _server_socket = None
@@ -129,6 +132,7 @@ _notify_timer = None
 _notify_pending = False
 _status = {
     "running": False, "port": 0, "clients": 0, "subscribed": 0,
+    "unresolved_writes": 0, "unresolved_last": None,
     "last_error": None, "started_at": None, "contributors": [],
 }
 
@@ -1224,6 +1228,51 @@ def _eager_paths():
     return out
 
 
+def _dir_batch():
+    """Nombre maximal d'éléments par MESSAGE Ember+ dans une réponse de GetDirectory.
+
+    Réglage `emberplus_dir_batch`. 0 = pas de découpage, c'est-à-dire le comportement
+    historique : un seul message, si gros soit-il.
+
+    ── Pourquoi (2026-09-23) ───────────────────────────────────────────────────────────
+    Le découpage S101 est correct et l'a toujours été : une réponse de 21,7 ko part en 22
+    trames de 1 024 octets, réassemblées par le consommateur en UN message. C'est ce message
+    que VSM ne digère pas en entier. Mesuré en tronquant nous-mêmes le message et en le
+    redécodant : à 4 096 octets on s'arrête au 8e objet de monitoring — et l'exploitant
+    constatait exactement que les objets 1 à 7 fonctionnaient et pas les suivants. Le tampon
+    de message est donc de l'ordre de 4 ko chez ce contrôleur.
+
+    On répond donc en PLUSIEURS messages, chacun une collection d'éléments qualifiés
+    autonome — le format s'y prête, un chemin absolu ne dépend d'aucun contexte. Le réglage
+    est un nombre d'éléments et non d'octets : c'est ce qu'on peut borner avant d'encoder, et
+    la taille d'un élément varie peu (~51 octets mesurés)."""
+    try:
+        n = int(settings.get("emberplus_dir_batch") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+
+def _children_bodies(path):
+    """Réponse à un GetDirectory, découpée en messages (cf. `_dir_batch`).
+
+    Renvoie une LISTE de corps encodés. Sans découpage réglé, la liste en contient un seul et
+    le comportement est identique à ce qu'il était."""
+    lot = _dir_batch()
+    if not lot:
+        return [_children_body(path)]
+    fils, extras = _children_parts(path)
+    corps = []
+    for i in range(0, len(fils), lot):
+        tranche = fils[i:i + lot]
+        # Les matrices voyagent avec le PREMIER message : elles sont peu nombreuses et
+        # doivent arriver avant qu'on parle de leurs axes.
+        corps.append(glow.build_collection(tranche, extra=extras if i == 0 else None))
+    if not corps:
+        corps = [glow.build_collection([], extra=extras)]
+    return corps
+
+
 def _children_body(path):
     """Corps d'un GetDirectory sur UN nœud : ses enfants DIRECTS, et rien d'autre.
 
@@ -1235,6 +1284,12 @@ def _children_body(path):
 
     Les éléments portent leur chemin COMPLET (arbre plat qualifié), donc une tranche s'encode
     exactement comme le tout : on filtre, on encode, rien d'autre à faire."""
+    fils, extras = _children_parts(path)
+    return glow.build_collection(fils, extra=extras)
+
+
+def _children_parts(path):
+    """(éléments, matrices) d'un GetDirectory — le calcul, sans l'encodage."""
     with _tree_lock:
         elements = list(_tree_cache.get("elements_list") or [])
         matrix_map = dict(_tree_cache.get("matrix_map") or {})
@@ -1258,7 +1313,7 @@ def _children_body(path):
                 fils.append(e)
         extras += [_encode_matrix(p, m, with_axes=False) for p, m in matrix_map.items()
                    if len(p) > ne and tuple(p[:ne]) == eag]
-    return glow.build_collection(fils, extra=extras)
+    return fils, extras
 
 
 _agg_refresh = {"en_cours": False}
@@ -1593,6 +1648,22 @@ def _apply_setvalue(path, value):
                         "pour que le contrôleur puisse l'atteindre, mais il n'y a pas de "
                         "récepteur où écrire.", path, motif)
             return False
+        # ⚠ Un chemin dont un élément est NÉGATIF n'est pas une feuille inconnue : c'est un
+        # chemin que le contrôleur n'a pas su résoudre. VSM se lie à l'identifiant, pas au
+        # numéro (cf. `_eager_paths`) : tant qu'il n'a pas parcouru le nœud, il écrit `-1` à
+        # la place du numéro de paramètre. Le confondre avec « inconnu ou lecture seule »
+        # nous a coûté cher : 104 écritures de tally vers le multiviewer C100, entre le 16 et
+        # le 19 septembre 2026, toutes en `[5, 2, n, -1]`, toutes rejetées — et personne ne
+        # l'a vu, parce qu'un tally qui n'arrive pas ressemble à un tally éteint.
+        if any(int(x) < 0 for x in path):
+            with _lock:
+                _rejets_non_resolus["total"] += 1
+                _rejets_non_resolus["dernier"] = {"chemin": list(path), "quand": time.time()}
+            log.warning("emberplus: setvalue %s REFUSÉ — chemin non résolu par le contrôleur "
+                        "(numéro négatif). Il écrit dans un nœud qu'il n'a pas parcouru : ce "
+                        "n'est pas un paramètre inconnu, c'est une adresse qu'il n'a pas. "
+                        "%d depuis le démarrage.", path, _rejets_non_resolus["total"])
+            return False
         log.info("emberplus: setvalue %s ignoré (inconnu ou lecture seule)", path)
         return False
     # `NC` est notre mot pour « ce matériel ne le dit pas » (§22), pas une valeur du device.
@@ -1713,6 +1784,8 @@ def status_dict():
     with _lock:
         _status["clients"] = len(_clients)
         _status["subscribed"] = len(_subscribed)
+        _status["unresolved_writes"] = _rejets_non_resolus["total"]
+        _status["unresolved_last"] = _rejets_non_resolus["dernier"]
         return dict(_status)
 
 # Trame S101 mémorisée. Encadrer 3,5 Mo coûte 3,5 s (mesuré le 2026-09-17) : c'était payé à
@@ -1953,7 +2026,8 @@ def _process_message(sock, addr, kind, payload):
                 # Réponse À LA DEMANDE : les enfants directs du nœud visé. C'est le
                 # comportement attendu d'un provider, et il évite de repousser tout l'arbre
                 # à chaque pas d'un consommateur qui descend.
-                _send_frame(sock, _children_body(list(mp)))
+                for corps in _children_bodies(list(mp)):
+                    _send_frame(sock, corps)
             else:
                 # Repli historique : l'arbre entier. Réglage de secours si un contrôleur
                 # s'avérait dépendre de cette poussée massive — le mettre à faux et le dire.
