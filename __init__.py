@@ -119,8 +119,48 @@ _MATRIX_TYPE = {
 
 # ─── État serveur ───────────────────────────────────────────
 _lock = threading.Lock()
-_clients = set()               # connexions actives
-_subscribed = set()            # sockets ayant souscrit au broadcast
+
+
+class _Ecoute:
+    """UNE écoute du provider : son socket, ses connexions, ses abonnés, ses racines.
+
+    ── Pourquoi plusieurs écoutes (2026-09-23) ─────────────────────────────────────────
+    Un seul arbre, plusieurs portes. La demande vient de l'exploitation : le tally du
+    multiviewer doit survivre à ce qui arrive au parc IPG. Or toute modification de STRUCTURE
+    de l'arbre (un matériel qui apparaît ou disparaît, une réaffectation) force un renvoi
+    COMPLET à tous les abonnés — et le contrôleur ne digère qu'environ 4 ko par message. Une
+    écoute dédiée ne voit plus jamais passer ces renvois : ce qui bouge dans l'IPG ne traverse
+    plus la connexion du multiviewer.
+
+    ⚠ Une écoute secondaire n'ENLÈVE rien à la principale : la branche reste servie aux deux.
+    C'est une porte de plus, pas un déménagement — un contrôleur déjà câblé sur la principale
+    continue de fonctionner sans rien changer.
+
+    `racines` = None signifie « tout l'arbre » (l'écoute principale). Sinon, seules les racines
+    listées sont servies et diffusées ; le reste n'existe pas pour cette porte."""
+
+    def __init__(self, nom, racines=None):
+        self.nom = nom
+        self.racines = racines          # None = tout
+        self.sock = None
+        self.port = 0
+        self.clients = set()
+        self.abonnes = set()
+        self.fil = None
+
+    def sert(self, racine):
+        """Cette écoute diffuse-t-elle ce qui vit sous `racine` ? (None = trafic global)"""
+        return self.racines is None or racine is None or int(racine) in self.racines
+
+    def __repr__(self):
+        return "<écoute %s :%s %s>" % (self.nom, self.port,
+                                       "tout" if self.racines is None else sorted(self.racines))
+
+
+_principale = _Ecoute("principal")
+_ecoutes = [_principale]       # principale + éventuelle écoute dédiée
+_clients = _principale.clients      # connexions actives (écoute principale)
+_subscribed = _principale.abonnes   # sockets ayant souscrit au broadcast (idem)
 # Écritures refusées parce que le CONTRÔLEUR n'avait pas résolu le chemin (numéro négatif).
 # Compté et exposé dans l'état du service : ce défaut-là ne fait aucun bruit tout seul.
 _rejets_non_resolus = {"total": 0, "dernier": None}
@@ -132,7 +172,7 @@ _notify_timer = None
 _notify_pending = False
 _status = {
     "running": False, "port": 0, "clients": 0, "subscribed": 0,
-    "unresolved_writes": 0, "unresolved_last": None,
+    "unresolved_writes": 0, "unresolved_last": None, "ecoutes": [],
     "last_error": None, "started_at": None, "contributors": [],
 }
 
@@ -402,6 +442,21 @@ def _encode_matrix(mpath, m, *, with_axes):
     mtype = _MATRIX_TYPE.get(str(decl.get("type") or "oneToN").lower(), glow.MATRIX_ONE_TO_N)
     return glow.qualified_matrix(list(mpath), m["label"], str(decl.get("description") or ""),
                                  mtype, tnums, snums, conns, with_axes=with_axes)
+
+def _corps_racines(racines):
+    """Corps racine restreint à `racines` — l'équivalent de `_encoded_body` pour une écoute
+    dédiée. Non mémoïsé : une écoute dédiée est rare et son arbre est petit (la branche du
+    multiviewer pèse 421 éléments contre ~21 600 pour l'IPG)."""
+    if racines is None:
+        return _encoded_body()
+    with _tree_lock:
+        elements = list(_tree_cache.get("elements_list") or [])
+        matrix_map = dict(_tree_cache.get("matrix_map") or {})
+    fils = [e for e in elements if e[0] and int(e[0][0]) in racines]
+    extras = [_encode_matrix(p, m, with_axes=False)
+              for p, m in matrix_map.items() if p and int(p[0]) in racines]
+    return glow.build_collection(fils, extra=extras)
+
 
 def _matrix_body(mpath, m):
     """Réponse à GetDirectory(matrice) : la QualifiedMatrix COMPLÈTE (axes + connexions)."""
@@ -1253,15 +1308,18 @@ def _dir_batch():
     return n if n > 0 else 0
 
 
-def _children_bodies(path):
+def _children_bodies(path, racines=None):
     """Réponse à un GetDirectory, découpée en messages (cf. `_dir_batch`).
 
     Renvoie une LISTE de corps encodés. Sans découpage réglé, la liste en contient un seul et
     le comportement est identique à ce qu'il était."""
     lot = _dir_batch()
-    if not lot:
-        return [_children_body(path)]
     fils, extras = _children_parts(path)
+    if racines is not None:
+        fils = [e for e in fils if e[0] and int(e[0][0]) in racines]
+        extras = [x for x in extras]          # les matrices sont déjà bornées par `path`
+    if not lot:
+        return [glow.build_collection(fils, extra=extras)]
     corps = []
     for i in range(0, len(fils), lot):
         tranche = fils[i:i + lot]
@@ -1507,7 +1565,8 @@ def _append_service_node(elements, path_map, seen):
     outil : il n'entre donc PAS dans `path_map` (qui route vers un plugin) et son écriture est
     interceptée en amont par `_apply_service_setvalue`."""
     with _lock:
-        nsub, ncli = len(_subscribed), len(_clients)
+        nsub = sum(len(e.abonnes) for e in _ecoutes)
+        ncli = sum(len(e.clients) for e in _ecoutes)
         contribs = ", ".join(c.get("type", "") for c in _status.get("contributors") or [])
         port = int(_status.get("port") or 0)
         started = _status.get("started_at")
@@ -1782,8 +1841,12 @@ def _apply_connect(matrix_path, target, sources, operation):
 
 def status_dict():
     with _lock:
-        _status["clients"] = len(_clients)
-        _status["subscribed"] = len(_subscribed)
+        _status["clients"] = sum(len(e.clients) for e in _ecoutes)
+        _status["subscribed"] = sum(len(e.abonnes) for e in _ecoutes)
+        _status["ecoutes"] = [{"nom": e.nom, "port": e.port,
+                               "racines": (None if e.racines is None else sorted(e.racines)),
+                               "clients": len(e.clients), "abonnes": len(e.abonnes)}
+                              for e in _ecoutes]
         _status["unresolved_writes"] = _rejets_non_resolus["total"]
         _status["unresolved_last"] = _rejets_non_resolus["dernier"]
         return dict(_status)
@@ -1815,15 +1878,26 @@ def _send_frame(sock, body):
         log.debug("emberplus: send échoué : %s", e)
         return False
 
-def _send_frames(frames):
-    """Envoie une suite de frames à tous les abonnés ; retire ceux dont le socket est mort."""
+def _send_frames(frames, racine=None):
+    """Envoie une suite de frames aux abonnés ; retire ceux dont le socket est mort.
+
+    `racine` désigne la branche concernée : une écoute qui ne la sert pas ne reçoit rien.
+    Sans `racine`, la diffusion est globale et toutes les écoutes la reçoivent."""
     with _lock:
-        dead = []
-        for s in list(_subscribed):
-            if not all(_send_frame(s, fr) for fr in frames):
-                dead.append(s)
-        for s in dead:
-            _subscribed.discard(s)
+        cibles = [ec for ec in _ecoutes if ec.sert(racine)]
+    for ec in cibles:
+        _envoyer(ec, frames)
+
+
+def _envoyer(ec, frames):
+    """Envoie à UNE écoute, et oublie les sockets morts."""
+    with _lock:
+        abonnes = list(ec.abonnes)
+    dead = [s for s in abonnes if not all(_send_frame(s, fr) for fr in frames)]
+    if dead:
+        with _lock:
+            for s in dead:
+                ec.abonnes.discard(s)
 
 def _diff_elements(old, new):
     """Compare deux index {chemin: élément} → (structure_changée, [éléments modifiés]).
@@ -1867,22 +1941,32 @@ def _broadcast_update():
     with _tree_lock:
         new = dict(_tree_cache.get("elements") or {})
     structural, changed = _diff_elements(old, new) if primed else (True, [])
-    if structural:
-        # Racine (nœuds/params + matrices contents-seuls) PUIS chaque matrice complète, pour
-        # que les tallies de connexions remontent aux abonnés après un crosspoint.
-        # L'encodage complet n'a lieu QUE dans ce cas : sur un tick ordinaire, seuls les
-        # éléments modifiés sont encodés, ce qui rend la taille de l'arbre indolore.
-        frames = [_encoded_body()] + [_matrix_body(p, m) for p, m in matrix_map.items()]
-    elif changed:
-        frames = [glow.build_collection(changed)]
-    else:
+    if not structural and not changed:
         return
     if glow.DEBUG:
         log.info("emberplus: broadcast %s (%d élément(s))",
                  "arbre complet" if structural else "incrémental", len(changed))
     global _last_push_ts
     _last_push_ts = time.time()
-    _send_frames(frames)
+    # UNE trame par écoute, restreinte à ses racines. C'est ici que se joue l'isolement
+    # demandé : un changement de structure du parc IPG force un renvoi complet, mais une
+    # écoute dédiée au multiviewer n'en voit que sa propre branche — donc rien du tout si
+    # rien n'a bougé chez elle.
+    with _lock:
+        cibles = [ec for ec in _ecoutes if ec.abonnes]
+    for ec in cibles:
+        r = ec.racines
+        if structural:
+            frames = [_corps_racines(r)] + [
+                _matrix_body(p, m) for p, m in matrix_map.items()
+                if r is None or (p and int(p[0]) in r)]
+        else:
+            elts = changed if r is None else [e for e in changed
+                                              if e[0] and int(e[0][0]) in r]
+            if not elts:
+                continue          # rien de neuf sous les racines de cette écoute
+            frames = [glow.build_collection(elts)]
+        _envoyer(ec, frames)
 
 def _broadcast_param(path, valeur):
     """Repousse IMMÉDIATEMENT une seule feuille, avec sa nouvelle valeur (§25.5).
@@ -1925,14 +2009,14 @@ def _broadcast_param(path, valeur):
                     lst[i] = neuf
                     break
         _tree_cache["body"] = None          # le corps mémoïsé porte l'ancienne valeur
-    _send_frames([glow.build_collection([neuf])])
+    _send_frames([glow.build_collection([neuf])], racine=(path[0] if path else None))
     return True
 
 
 def _broadcast_matrix(mpath, m):
     """Envoie IMMÉDIATEMENT (sans débounce) la frame d'UNE matrice aux abonnés — fait remonter
     le tally d'un crosspoint à VSM sans attendre une reconstruction d'arbre."""
-    _send_frames([_matrix_body(list(mpath), m)])
+    _send_frames([_matrix_body(list(mpath), m)], racine=(mpath[0] if mpath else None))
 
 def notify_change():
     """Broadcast aux abonnés. Débounce : max 1 / NOTIFY_DEBOUNCE_S."""
@@ -1959,8 +2043,8 @@ def notify_change():
         _notify_timer.daemon = True
         _notify_timer.start()
 
-def _handle_client(sock, addr):
-    log.info("emberplus: client %s connecté", addr)
+def _handle_client(ec, sock, addr):
+    log.info("emberplus: client %s connecté (écoute %s:%s)", addr, ec.nom, ec.port)
     reader = glow.S101Reader()
     sock.settimeout(60.0)
     try:
@@ -1985,18 +2069,18 @@ def _handle_client(sock, addr):
             if glow.DEBUG:
                 log.info("emberplus: ← %s %d bytes: %s", addr, len(data), data.hex())
             for kind, payload in reader.feed(data):
-                _process_message(sock, addr, kind, payload)
+                _process_message(ec, sock, addr, kind, payload)
     except Exception as e:
         log.warning("emberplus: client %s erreur : %s", addr, e)
     finally:
         with _lock:
-            _clients.discard(sock)
-            _subscribed.discard(sock)
+            ec.clients.discard(sock)
+            ec.abonnes.discard(sock)
         try: sock.close()
         except Exception: pass
-        log.info("emberplus: client %s déconnecté", addr)
+        log.info("emberplus: client %s déconnecté (écoute %s)", addr, ec.nom)
 
-def _process_message(sock, addr, kind, payload):
+def _process_message(ec, sock, addr, kind, payload):
     if kind == "keepalive_req":
         try: sock.sendall(glow.s101_encode_keepalive_response())
         except Exception: pass
@@ -2013,28 +2097,36 @@ def _process_message(sock, addr, kind, payload):
     for a in actions:
         if a["kind"] in ("getdir", "subscribe"):
             with _lock:
-                _subscribed.add(sock)
+                ec.abonnes.add(sock)
             # ⚠ On n'ENCODE PAS le corps racine ici : `_current_tree()` le produisait à chaque
             # GetDirectory, y compris pour répondre trois lignes. Seules les tables sont
             # nécessaires pour choisir la branche ; le corps complet n'est encodé que dans le
             # repli historique, ci-dessous.
             _, matrix_map = _reaggregate()
             mp = tuple(a.get("path") or [])
+            # Écoute dédiée : elle ne connaît QUE ses racines. Une demande qui sort de son
+            # périmètre reçoit une collection vide — pas une erreur : du point de vue de
+            # cette porte, cette branche n'existe pas. C'est ce qui garantit qu'un
+            # contrôleur câblé là ne verra jamais passer le reste de l'arbre.
+            if ec.racines is not None and mp and int(mp[0]) not in ec.racines:
+                _send_frame(sock, glow.build_collection([]))
+                continue
             if mp in matrix_map:                       # GetDirectory SUR une matrice
                 _send_frame(sock, _matrix_body(mp, matrix_map[mp]))
             elif bool(settings.get("emberplus_lazy_dir")):
                 # Réponse À LA DEMANDE : les enfants directs du nœud visé. C'est le
                 # comportement attendu d'un provider, et il évite de repousser tout l'arbre
                 # à chaque pas d'un consommateur qui descend.
-                for corps in _children_bodies(list(mp)):
+                for corps in _children_bodies(list(mp), racines=ec.racines):
                     _send_frame(sock, corps)
             else:
-                # Repli historique : l'arbre entier. Réglage de secours si un contrôleur
-                # s'avérait dépendre de cette poussée massive — le mettre à faux et le dire.
-                _send_frame(sock, _encoded_body())
+                # Repli historique : l'arbre entier — restreint aux racines de l'écoute.
+                # Réglage de secours si un contrôleur s'avérait dépendre de cette poussée
+                # massive : le mettre à faux et le dire.
+                _send_frame(sock, _corps_racines(ec.racines))
         elif a["kind"] == "unsubscribe":
             with _lock:
-                _subscribed.discard(sock)
+                ec.abonnes.discard(sock)
         elif a["kind"] == "setvalue":
             if not _write_allowed(addr):
                 log.warning("emberplus: SetValue REFUSÉ depuis %s (hors liste d'écriture)", addr)
@@ -2052,7 +2144,7 @@ def _process_message(sock, addr, kind, payload):
                 continue
             _apply_connect(a["matrix_path"], a["target"], a["sources"], a["operation"])
 
-def _server_loop(port):
+def _server_loop(ec, port):
     global _server_socket, _running
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -2062,16 +2154,31 @@ def _server_loop(port):
         s.settimeout(1.0)
     except Exception as e:
         with _lock:
-            _status["last_error"] = f"bind: {e}"
-            _status["running"] = False
-        _running = False
-        log.error("emberplus: bind sur %s échoué : %s", port, e)
+            _status["last_error"] = f"bind {ec.nom}: {e}"
+            if ec is _principale:
+                _status["running"] = False
+        # ⚠ Une écoute SECONDAIRE qui ne peut pas se lier ne doit pas arrêter le provider :
+        # le multiviewer perdrait sa porte dédiée, mais le parc entier perdrait la sienne.
+        # On le dit, et on continue.
+        if ec is _principale:
+            _running = False
+        log.error("emberplus: bind %s sur %s échoué : %s", ec.nom, port, e)
         return
-    _server_socket = s
+    ec.sock = s
+    ec.port = port
+    if ec is _principale:
+        _server_socket = s
     with _lock:
-        _status.update({"running": True, "port": port,
-                        "last_error": None, "started_at": time.time()})
-    log.info("emberplus: serveur lancé sur :%s", port)
+        if ec is _principale:
+            _status.update({"running": True, "port": port,
+                            "last_error": None, "started_at": time.time()})
+        _status["ecoutes"] = [{"nom": e.nom, "port": e.port,
+                               "racines": (None if e.racines is None else sorted(e.racines)),
+                               "clients": len(e.clients), "abonnes": len(e.abonnes)}
+                              for e in _ecoutes]
+    log.info("emberplus: écoute %s lancée sur :%s (%s)", ec.nom, port,
+             "tout l'arbre" if ec.racines is None else
+             "racines " + ", ".join(str(x) for x in sorted(ec.racines)))
     while _running:
         try:
             conn, addr = s.accept()
@@ -2082,13 +2189,15 @@ def _server_loop(port):
                 log.warning("emberplus: accept erreur : %s", e)
             break
         with _lock:
-            _clients.add(conn)
-        threading.Thread(target=_handle_client, args=(conn, addr), daemon=True).start()
+            ec.clients.add(conn)
+        threading.Thread(target=_handle_client, args=(ec, conn, addr), daemon=True).start()
     try: s.close()
     except Exception: pass
+    ec.sock = None
     with _lock:
-        _status["running"] = False
-    log.info("emberplus: serveur arrêté")
+        if ec is _principale:
+            _status["running"] = False
+    log.info("emberplus: écoute %s arrêtée", ec.nom)
 
 def _push_interval():
     """Cadence du pousseur, bornée : un réglage absurde ne doit pas noyer les contributeurs."""
@@ -2113,7 +2222,7 @@ def _push_loop():
         if not _running:
             break
         with _lock:
-            has_subs = bool(_subscribed)
+            has_subs = any(e.abonnes for e in _ecoutes)
         if not has_subs:
             continue
         try:
@@ -2122,13 +2231,48 @@ def _push_loop():
             log.debug("emberplus: push périodique échoué : %s", e)
 
 
+def _tally_racines():
+    """Racines servies par l'écoute dédiée. Vide = pas d'écoute dédiée."""
+    brut = str(settings.get("emberplus_tally_roots") or "")
+    out = set()
+    for morceau in brut.replace(",", " ").split():
+        try:
+            out.add(int(morceau))
+        except ValueError:
+            continue           # une racine illisible est ignorée, jamais devinée
+    return out
+
+
+def _tally_port():
+    try:
+        n = int(settings.get("emberplus_tally_port") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return n if 1 <= n <= 65535 else 0
+
+
 def start(port):
-    """Démarre (ou redémarre) le serveur sur `port`."""
-    global _server_thread, _push_thread, _running
+    """Démarre (ou redémarre) le provider : l'écoute principale, et l'écoute dédiée si elle
+    est réglée (`emberplus_tally_port` + `emberplus_tally_roots`).
+
+    ⚠ L'écoute dédiée n'ENLÈVE rien à la principale : les racines qu'elle sert y restent
+    servies. C'est une porte de plus pour un contrôleur qui veut s'abonner à une branche sans
+    subir les renvois complets provoqués par le reste de l'arbre."""
+    global _server_thread, _push_thread, _running, _ecoutes
     stop()
     _running = True
-    _server_thread = threading.Thread(target=_server_loop, args=(int(port),), daemon=True)
-    _server_thread.start()
+    _ecoutes = [_principale]
+    racines, tport = _tally_racines(), _tally_port()
+    if tport and racines:
+        _ecoutes.append(_Ecoute("tally", racines))
+    elif tport and not racines:
+        log.warning("emberplus: `emberplus_tally_port` réglé sans `emberplus_tally_roots` — "
+                    "une écoute qui ne sert aucune racine n'aurait rien à dire, on ne la lance pas")
+    for ec in _ecoutes:
+        p = int(port) if ec is _principale else tport
+        ec.fil = threading.Thread(target=_server_loop, args=(ec, p), daemon=True)
+        ec.fil.start()
+    _server_thread = _principale.fil
     _push_thread = threading.Thread(target=_push_loop, daemon=True)
     _push_thread.start()
 
@@ -2139,16 +2283,20 @@ def stop():
         return
     _running = False       # le pousseur sort de sa boucle au prochain réveil
     with _lock:
-        for sock in list(_clients):
-            try: sock.close()
+        for ec in _ecoutes:
+            for sock in list(ec.clients):
+                try: sock.close()
+                except Exception: pass
+            ec.clients.clear()
+            ec.abonnes.clear()
+    for ec in _ecoutes:
+        if ec.sock:
+            try: ec.sock.close()
             except Exception: pass
-        _clients.clear()
-        _subscribed.clear()
-    if _server_socket:
-        try: _server_socket.close()
-        except Exception: pass
-    if _server_thread:
-        _server_thread.join(timeout=2)
+    for ec in _ecoutes:
+        if ec.fil:
+            ec.fil.join(timeout=2)
+        ec.fil = None
     _server_thread = None
     _push_thread = None    # daemon : pas de join, il dort peut-être tout l'intervalle
     with _lock:
