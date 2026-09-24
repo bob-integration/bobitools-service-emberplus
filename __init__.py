@@ -164,6 +164,41 @@ _subscribed = _principale.abonnes   # sockets ayant souscrit au broadcast (idem)
 # Écritures refusées parce que le CONTRÔLEUR n'avait pas résolu le chemin (numéro négatif).
 # Compté et exposé dans l'état du service : ce défaut-là ne fait aucun bruit tout seul.
 _rejets_non_resolus = {"total": 0, "dernier": None}
+
+# ── Alertes portées au JOURNAL d'exploitation ────────────────────────────────────────────
+# Une alerte qui ne va que dans le fichier texte n'existe pas : il tourne, il est partagé
+# entre tous les services, et il faut savoir le lire. Celles qui comptent entrent donc dans
+# la table `audit`, où elles se retrouvent à côté des actions, filtrables et datées — c'est
+# ce qui manquait pour rapprocher, à la seconde, un refus du Neuron d'une commutation SW-P-08.
+#
+# ⚠ ÉTRANGLÉES, et c'est indispensable. Un contrôleur qui n'obtient pas satisfaction réessaie
+# sans fin : la boucle de l'ANC du Neuron a produit 1 366 tentatives en trente minutes le
+# 2026-09-19. Les journaliser une par une noierait le journal et masquerait tout le reste.
+# On n'écrit donc qu'une entrée par motif toutes les ALERTE_REPOS secondes, en disant combien
+# de fois le motif s'est répété entre-temps — l'information qui manquait vraiment n'était pas
+# la millième occurrence, c'était qu'il y en avait eu mille.
+ALERTE_REPOS = 300.0
+_alertes = {}                  # clé -> {"ts": dernier envoi, "n": répétitions tues}
+
+
+def _alerte(action, detail, cle=None):
+    """Porte une alerte au journal d'exploitation, étranglée par motif. Ne lève jamais."""
+    cle = cle or action
+    now = time.time()
+    with _lock:
+        vu = _alertes.get(cle)
+        if vu and (now - vu["ts"]) < ALERTE_REPOS:
+            vu["n"] += 1
+            return
+        repet = vu["n"] if vu else 0
+        _alertes[cle] = {"ts": now, "n": 0}
+    if repet:
+        detail = "%s — et %d fois de plus depuis %.0f min" % (detail, repet, ALERTE_REPOS / 60)
+    try:
+        from app.database import audit_log
+        audit_log("emberplus", action, detail[:500])
+    except Exception as e:                    # un défaut d'audit ne casse jamais le service
+        log.debug("emberplus: alerte non journalisée : %s", e)
 _server_thread = None
 _push_thread = None            # pousseur périodique (cf. _push_loop)
 _server_socket = None
@@ -1706,6 +1741,8 @@ def _apply_setvalue(path, value):
             log.warning("emberplus: SDP RX %s NON appliqué — %s. La feuille est inscriptible "
                         "pour que le contrôleur puisse l'atteindre, mais il n'y a pas de "
                         "récepteur où écrire.", path, motif)
+            _alerte("alerte/sdp-sans-récepteur", "%s : %s" % (path, motif),
+                    cle="sdp-noref:%s" % (tuple(path),))
             return False
         # ⚠ Un chemin dont un élément est NÉGATIF n'est pas une feuille inconnue : c'est un
         # chemin que le contrôleur n'a pas su résoudre. VSM se lie à l'identifiant, pas au
@@ -1722,6 +1759,9 @@ def _apply_setvalue(path, value):
                         "(numéro négatif). Il écrit dans un nœud qu'il n'a pas parcouru : ce "
                         "n'est pas un paramètre inconnu, c'est une adresse qu'il n'a pas. "
                         "%d depuis le démarrage.", path, _rejets_non_resolus["total"])
+            _alerte("alerte/chemin-non-résolu",
+                    "%s : le contrôleur écrit dans un nœud qu'il n'a pas parcouru" % (path,),
+                    cle="non-résolu:%s" % (tuple(path[:-1]),))
             return False
         log.info("emberplus: setvalue %s ignoré (inconnu ou lecture seule)", path)
         return False
@@ -1774,6 +1814,12 @@ def _apply_setvalue(path, value):
         refresh(seulement=type_)
         return True
     log.warning("emberplus: set %s %s → %s %s", type_, ref, status, data)
+    # Un refus du matériel : c'est l'événement qu'on a passé une heure à chercher le
+    # 2026-09-23, faute qu'il apparaisse ailleurs que dans le fichier texte.
+    motif = (data or {}).get("error") if isinstance(data, dict) else None
+    _alerte("alerte/écriture-refusée",
+            "%s a refusé (%s) : %s" % (type_, status, motif or data),
+            cle="refus:%s:%s" % (type_, (motif or "")[:60]))
     return False
 
 _OP_NAME = {glow.CN_OP_ABSOLUTE: "absolute", glow.CN_OP_CONNECT: "connect",
