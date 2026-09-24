@@ -2231,9 +2231,13 @@ def _server_loop(ec, port):
                                "racines": (None if e.racines is None else sorted(e.racines)),
                                "clients": len(e.clients), "abonnes": len(e.abonnes)}
                               for e in _ecoutes]
-    log.info("emberplus: écoute %s lancée sur :%s (%s)", ec.nom, port,
+    log.info("emberplus: écoute %s lancée sur :%s (%s%s)", ec.nom, port,
              "tout l'arbre" if ec.racines is None else
-             "racines " + ", ".join(str(x) for x in sorted(ec.racines)))
+             "racines " + ", ".join(str(x) for x in sorted(ec.racines)),
+             # Une exclusion NON DITE est un piège : l'écoute principale annonçait « tout
+             # l'arbre » alors qu'une branche venait de lui être retirée.
+             "" if not ec.exclues else
+             ", sauf %s (déléguée)" % ", ".join(str(x) for x in sorted(ec.exclues)))
     while _running:
         try:
             conn, addr = s.accept()
