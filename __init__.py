@@ -139,18 +139,32 @@ class _Ecoute:
     `racines` = None signifie « tout l'arbre » (l'écoute principale). Sinon, seules les racines
     listées sont servies et diffusées ; le reste n'existe pas pour cette porte."""
 
-    def __init__(self, nom, racines=None):
+    def __init__(self, nom, racines=None, exclues=None):
         self.nom = nom
         self.racines = racines          # None = tout
+        # Racines DÉLÉGUÉES à une autre écoute et retirées de celle-ci. Sert quand la
+        # migration est faite : tant que le contrôleur n'était câblé que sur l'écoute
+        # principale, la brancher en double était la seule façon de basculer sans coupure —
+        # une fois basculé, la servir deux fois n'apporte plus que du trafic et deux
+        # vérités possibles sur le même paramètre.
+        self.exclues = set(exclues or ())
         self.sock = None
         self.port = 0
         self.clients = set()
         self.abonnes = set()
         self.fil = None
 
-    def sert(self, racine):
-        """Cette écoute diffuse-t-elle ce qui vit sous `racine` ? (None = trafic global)"""
-        return self.racines is None or racine is None or int(racine) in self.racines
+    def garde(self, racine):
+        """Cette écoute sert-elle ce qui vit sous `racine` ? (None = trafic global)"""
+        if racine is None:
+            return True
+        r = int(racine)
+        if r in self.exclues:
+            return False
+        return self.racines is None or r in self.racines
+
+    # Nom historique, conservé : `sert` disait la même chose avant les exclusions.
+    sert = garde
 
     def __repr__(self):
         return "<écoute %s :%s %s>" % (self.nom, self.port,
@@ -478,18 +492,16 @@ def _encode_matrix(mpath, m, *, with_axes):
     return glow.qualified_matrix(list(mpath), m["label"], str(decl.get("description") or ""),
                                  mtype, tnums, snums, conns, with_axes=with_axes)
 
-def _corps_racines(racines):
-    """Corps racine restreint à `racines` — l'équivalent de `_encoded_body` pour une écoute
-    dédiée. Non mémoïsé : une écoute dédiée est rare et son arbre est petit (la branche du
-    multiviewer pèse 421 éléments contre ~21 600 pour l'IPG)."""
-    if racines is None:
-        return _encoded_body()
+def _corps_ecoute(ec):
+    """Corps racine tel que CETTE écoute doit le servir (racines retenues moins exclues)."""
     with _tree_lock:
         elements = list(_tree_cache.get("elements_list") or [])
         matrix_map = dict(_tree_cache.get("matrix_map") or {})
-    fils = [e for e in elements if e[0] and int(e[0][0]) in racines]
+    if ec.racines is None and not ec.exclues:
+        return _encoded_body()
+    fils = [e for e in elements if e[0] and ec.garde(e[0][0])]
     extras = [_encode_matrix(p, m, with_axes=False)
-              for p, m in matrix_map.items() if p and int(p[0]) in racines]
+              for p, m in matrix_map.items() if p and ec.garde(p[0])]
     return glow.build_collection(fils, extra=extras)
 
 
@@ -1343,16 +1355,15 @@ def _dir_batch():
     return n if n > 0 else 0
 
 
-def _children_bodies(path, racines=None):
+def _children_bodies(path, ec=None):
     """Réponse à un GetDirectory, découpée en messages (cf. `_dir_batch`).
 
     Renvoie une LISTE de corps encodés. Sans découpage réglé, la liste en contient un seul et
     le comportement est identique à ce qu'il était."""
     lot = _dir_batch()
     fils, extras = _children_parts(path)
-    if racines is not None:
-        fils = [e for e in fils if e[0] and int(e[0][0]) in racines]
-        extras = [x for x in extras]          # les matrices sont déjà bornées par `path`
+    if ec is not None:
+        fils = [e for e in fils if e[0] and ec.garde(e[0][0])]
     if not lot:
         return [glow.build_collection(fils, extra=extras)]
     corps = []
@@ -2001,14 +2012,12 @@ def _broadcast_update():
     with _lock:
         cibles = [ec for ec in _ecoutes if ec.abonnes]
     for ec in cibles:
-        r = ec.racines
         if structural:
-            frames = [_corps_racines(r)] + [
+            frames = [_corps_ecoute(ec)] + [
                 _matrix_body(p, m) for p, m in matrix_map.items()
-                if r is None or (p and int(p[0]) in r)]
+                if p and ec.garde(p[0])]
         else:
-            elts = changed if r is None else [e for e in changed
-                                              if e[0] and int(e[0][0]) in r]
+            elts = [e for e in changed if e[0] and ec.garde(e[0][0])]
             if not elts:
                 continue          # rien de neuf sous les racines de cette écoute
             frames = [glow.build_collection(elts)]
@@ -2154,7 +2163,7 @@ def _process_message(ec, sock, addr, kind, payload):
             # périmètre reçoit une collection vide — pas une erreur : du point de vue de
             # cette porte, cette branche n'existe pas. C'est ce qui garantit qu'un
             # contrôleur câblé là ne verra jamais passer le reste de l'arbre.
-            if ec.racines is not None and mp and int(mp[0]) not in ec.racines:
+            if mp and not ec.garde(mp[0]):
                 _send_frame(sock, glow.build_collection([]))
                 continue
             if mp in matrix_map:                       # GetDirectory SUR une matrice
@@ -2163,13 +2172,13 @@ def _process_message(ec, sock, addr, kind, payload):
                 # Réponse À LA DEMANDE : les enfants directs du nœud visé. C'est le
                 # comportement attendu d'un provider, et il évite de repousser tout l'arbre
                 # à chaque pas d'un consommateur qui descend.
-                for corps in _children_bodies(list(mp), racines=ec.racines):
+                for corps in _children_bodies(list(mp), ec=ec):
                     _send_frame(sock, corps)
             else:
-                # Repli historique : l'arbre entier — restreint aux racines de l'écoute.
+                # Repli historique : l'arbre entier — tel que CETTE écoute doit le servir.
                 # Réglage de secours si un contrôleur s'avérait dépendre de cette poussée
                 # massive : le mettre à faux et le dire.
-                _send_frame(sock, _corps_racines(ec.racines))
+                _send_frame(sock, _corps_ecoute(ec))
         elif a["kind"] == "unsubscribe":
             with _lock:
                 ec.abonnes.discard(sock)
@@ -2309,6 +2318,11 @@ def start(port):
     _running = True
     _ecoutes = [_principale]
     racines, tport = _tally_racines(), _tally_port()
+    # `emberplus_tally_exclusive` : une fois le contrôleur BASCULÉ sur l'écoute dédiée, la
+    # branche n'a plus à être servie deux fois. Tant que c'est faux, elle l'est sur les deux
+    # — c'est ce qui permet de basculer sans coupure, et de revenir en arrière d'une case.
+    exclusif = bool(settings.get("emberplus_tally_exclusive")) and tport and racines
+    _principale.exclues = set(racines) if exclusif else set()
     if tport and racines:
         _ecoutes.append(_Ecoute("tally", racines))
     elif tport and not racines:
@@ -2429,6 +2443,7 @@ def register_routes(bp):
         out["ui_url_setting"] = str(settings.get("emberplus_ui_url") or "")
         out["tally_port_setting"] = _tally_port()
         out["tally_roots_setting"] = " ".join(str(x) for x in sorted(_tally_racines()))
+        out["tally_exclusive_setting"] = bool(settings.get("emberplus_tally_exclusive"))
         out["eager_paths_setting"] = str(settings.get("emberplus_eager_paths") or "")
         out["dir_batch_setting"] = _dir_batch()
         out["ui_url"] = _ui_url()       # ce qui est réellement publié, détecté ou forcé
@@ -2526,6 +2541,8 @@ def register_routes(bp):
                 return jsonify({"error": "l'écoute dédiée ne peut pas partager le port "
                                          "de l'écoute principale"}), 400
             settings.set("emberplus_tally_port", tport)
+        if "tally_exclusive" in data:
+            settings.set("emberplus_tally_exclusive", bool(data.get("tally_exclusive")))
         for champ, cle in (("tally_roots", "emberplus_tally_roots"),
                            ("eager_paths", "emberplus_eager_paths")):
             v = data.get(champ)
