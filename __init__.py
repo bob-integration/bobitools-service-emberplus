@@ -2381,6 +2381,10 @@ def register_routes(bp):
         out["slots_count_setting"] = ipg_io.num_slots()
         out["lanes_per_slot_setting"] = ipg_io.lanes_per_slot()
         out["ui_url_setting"] = str(settings.get("emberplus_ui_url") or "")
+        out["tally_port_setting"] = _tally_port()
+        out["tally_roots_setting"] = " ".join(str(x) for x in sorted(_tally_racines()))
+        out["eager_paths_setting"] = str(settings.get("emberplus_eager_paths") or "")
+        out["dir_batch_setting"] = _dir_batch()
         out["ui_url"] = _ui_url()       # ce qui est réellement publié, détecté ou forcé
         return jsonify(out)
 
@@ -2459,6 +2463,37 @@ def register_routes(bp):
                 settings.set("emberplus_ui_url", ui)
                 _ui_url_cache["ts"] = 0.0      # forcer la relecture, forcée comme détectée
                 structure = True               # la valeur publiée change → réémettre
+        # ── Écoute dédiée + réponses aux GetDirectory ────────────────────────────
+        # Tous les quatre s'appliquent À CHAUD, sauf le port de l'écoute dédiée, qui demande
+        # un redémarrage du provider (fait plus bas par `start`). Les mettre à l'écran plutôt
+        # que dans la base : ils changent ce que le contrôleur reçoit, personne ne doit avoir
+        # à les deviner.
+        tport = data.get("tally_port")
+        if tport is not None:
+            try:
+                tport = int(tport or 0)
+            except (TypeError, ValueError):
+                return jsonify({"error": "port de l'écoute dédiée invalide"}), 400
+            if tport and not (1 <= tport <= 65535):
+                return jsonify({"error": "port de l'écoute dédiée hors bornes"}), 400
+            if tport and tport == port:
+                return jsonify({"error": "l'écoute dédiée ne peut pas partager le port "
+                                         "de l'écoute principale"}), 400
+            settings.set("emberplus_tally_port", tport)
+        for champ, cle in (("tally_roots", "emberplus_tally_roots"),
+                           ("eager_paths", "emberplus_eager_paths")):
+            v = data.get(champ)
+            if v is not None:
+                settings.set(cle, str(v).strip())
+        lot = data.get("dir_batch")
+        if lot is not None:
+            try:
+                lot = int(lot or 0)
+            except (TypeError, ValueError):
+                return jsonify({"error": "taille de lot invalide"}), 400
+            if lot < 0 or lot > 10000:
+                return jsonify({"error": "taille de lot hors bornes (0–10000)"}), 400
+            settings.set("emberplus_dir_batch", lot)
         if structure:
             refresh()          # la taille des grilles change la STRUCTURE → réémettre l'arbre
         settings.set("emberplus_enabled", enabled)
