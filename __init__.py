@@ -1730,7 +1730,16 @@ def _write_allow_list():
     return {p.strip() for p in str(raw).replace(";", ",").split(",") if p.strip()}
 
 
-def _apply_setvalue(path, value):
+def _principal(addr):
+    """Le contrôleur qui a émis l'ordre, tel que le cœur l'évalue contre les règles de
+    PÉRIMÈTRE de l'outil (Réglages → Outils → Périmètres). None = appel de confiance."""
+    if addr is None:
+        return None
+    from app import droits
+    return droits.who_controller(addr, "emberplus")
+
+
+def _apply_setvalue(path, value, addr=None):
     if _apply_service_setvalue(path, value):     # paramètres du service, avant tout routage
         return True
     # Table des chemins DÉJÀ CONNUE, même au-delà de TREE_TTL_S : un chemin inscriptible bouge
@@ -1798,7 +1807,8 @@ def _apply_setvalue(path, value):
     payload = {"ref": ref, "value": value}
     if field:
         payload["field"] = field
-    status, data = tools.call(type_, "ember/set", "POST", payload, actor=EMBER_ACTOR)
+    status, data = tools.call(type_, "ember/set", "POST", payload, actor=EMBER_ACTOR,
+                              principal=_principal(addr))
     ok = status == 200 and isinstance(data, dict) and not data.get("error")
     if ok:
         detail = json.dumps(payload, ensure_ascii=False)[:400]
@@ -1856,7 +1866,7 @@ def _reload_matrix(type_, mpath):
         return None
     return local_mm.get(tuple(mpath))
 
-def _apply_connect(matrix_path, target, sources, operation):
+def _apply_connect(matrix_path, target, sources, operation, addr=None):
     """Route un crosspoint (consumer→provider) vers l'outil propriétaire de la matrice."""
     _, matrix_map = _reaggregate()      # tables seules : pas besoin d'encoder l'arbre
     m = matrix_map.get(tuple(matrix_path))
@@ -1869,7 +1879,8 @@ def _apply_connect(matrix_path, target, sources, operation):
     # exemple —, qui gardent leur propre chemin d'écriture.
     status, data = tools.call(m["type"], "ember/connect", "POST",
                               {"ref": m["ref"], "target": target,
-                               "sources": sources, "operation": op}, actor=EMBER_ACTOR)
+                               "sources": sources, "operation": op}, actor=EMBER_ACTOR,
+                              principal=_principal(addr))
     ok = status == 200 and isinstance(data, dict) and not data.get("error")
     if ok:
         detail = json.dumps({"ref": m["ref"], "target": target,
@@ -2186,7 +2197,7 @@ def _process_message(ec, sock, addr, kind, payload):
             if not _write_allowed(addr):
                 log.warning("emberplus: SetValue REFUSÉ depuis %s (hors liste d'écriture)", addr)
                 continue
-            _apply_setvalue(a["path"], a["value"])
+            _apply_setvalue(a["path"], a["value"], addr)
         elif a["kind"] == "connect":
             if not _write_allowed(addr):
                 log.warning("emberplus: crosspoint REFUSÉ depuis %s (hors liste d'écriture)", addr)
@@ -2197,7 +2208,7 @@ def _process_message(ec, sock, addr, kind, payload):
                 if m:
                     _send_frame(sock, _matrix_body(list(a["matrix_path"]), m))
                 continue
-            _apply_connect(a["matrix_path"], a["target"], a["sources"], a["operation"])
+            _apply_connect(a["matrix_path"], a["target"], a["sources"], a["operation"], addr)
 
 def _server_loop(ec, port):
     global _server_socket, _running
